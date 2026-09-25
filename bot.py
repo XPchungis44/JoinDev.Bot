@@ -1,16 +1,19 @@
 """
-bot.py — JoinDev Discord bot skeleton
+bot.py — JoinDev Discord bot with OAuth callback + Postgres
 Python 3.11+ | discord.py 2.4+
 """
 
 import os
 import logging
+import threading
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from welcome import build_welcome_embed
+from oauth_callback import oauth_app, WELCOME_QUEUE_FILE
+from database import init_db
 
 # ---------------------------------------------------------------
 # CONFIG
@@ -29,11 +32,54 @@ log = logging.getLogger("joindev")
 # BOT SETUP
 # ---------------------------------------------------------------
 intents = discord.Intents.default()
-intents.members = True       # needed for guild member tracking
-intents.message_content = False  # we don't need to read messages
-intents.dm_messages = True   # needed for /daily in DMs
+intents.members = True
+intents.dm_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ---------------------------------------------------------------
+# FLASK IN BACKGROUND THREAD
+# ---------------------------------------------------------------
+def run_flask():
+    oauth_app.run(host="0.0.0.0", port=5000, use_reloader=False)
+
+
+def start_flask():
+    threading.Thread(target=run_flask, daemon=True).start()
+    log.info("OAuth callback server started on port 5000")
+
+
+# ---------------------------------------------------------------
+# WELCOME QUEUE WATCHER
+# ---------------------------------------------------------------
+@tasks.loop(seconds=5)
+async def watch_welcome_queue():
+    """Checks for new user IDs in the queue and sends welcome DMs."""
+    if not os.path.exists(WELCOME_QUEUE_FILE):
+        return
+
+    try:
+        with open(WELCOME_QUEUE_FILE, "r") as f:
+            user_ids = [line.strip() for line in f if line.strip()]
+
+        if not user_ids:
+            return
+
+        open(WELCOME_QUEUE_FILE, "w").close()  # clear queue
+
+        for user_id in user_ids:
+            try:
+                user = await bot.fetch_user(int(user_id))
+                await user.send(embed=build_welcome_embed())
+                log.info(f"Welcome DM sent to {user} ({user_id})")
+            except discord.Forbidden:
+                log.warning(f"Cannot DM user {user_id} — DMs closed.")
+            except discord.HTTPException as e:
+                log.error(f"Failed to DM {user_id}: {e}")
+
+    except IOError as e:
+        log.error(f"Queue watcher error: {e}")
 
 
 # ---------------------------------------------------------------
@@ -50,6 +96,8 @@ async def on_ready():
     except Exception as e:
         log.error(f"Failed to sync commands: {e}")
 
+    watch_welcome_queue.start()
+
 
 # ---------------------------------------------------------------
 # SLASH COMMANDS
@@ -63,49 +111,9 @@ async def ping(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------
-# WELCOME DM (called by OAuth callback)
-# ---------------------------------------------------------------
-async def send_welcome_dm(user_id: int) -> bool:
-    """
-    Sends the JoinDev welcome embed to a user via DM.
-
-    Args:
-        user_id: Discord user ID (from OAuth callback)
-
-    Returns:
-        True if sent, False if the user has DMs closed.
-    """
-    try:
-        user = await bot.fetch_user(user_id)
-        embed = build_welcome_embed()
-        await user.send(embed=embed)
-        log.info(f"Welcome DM sent to {user} ({user_id})")
-        return True
-    except discord.Forbidden:
-        log.warning(f"Could not DM user {user_id} — DMs are closed.")
-        return False
-    except discord.HTTPException as e:
-        log.error(f"Failed to send welcome DM to {user_id}: {e}")
-        return False
-
-
-# ---------------------------------------------------------------
-# HELPER: MAX JOINABLE SERVERS
-# ---------------------------------------------------------------
-def max_joinable_servers() -> int:
-    """
-    Returns how many more servers the user could theoretically join.
-
-    Note: Discord's hard cap for a user is 100 servers.
-    This helper is a placeholder — the actual available count is
-    calculated per-user in the /auto_join logic (100 - current_guilds).
-    """
-    DISCORD_USER_GUILD_LIMIT = 100
-    return DISCORD_USER_GUILD_LIMIT
-
-
-# ---------------------------------------------------------------
 # RUN
 # ---------------------------------------------------------------
 if __name__ == "__main__":
+    init_db()          # create schema + table on startup
+    start_flask()      # start OAuth callback server
     bot.run(TOKEN)
