@@ -94,3 +94,66 @@ async def set_do_not_join(user_id: int, flag: bool):
             "UPDATE joindev.users SET do_not_join = $2 WHERE user_id = $1",
             user_id, 1 if flag else 0,
         )
+
+
+async def claim_daily(user_id: int, now: int) -> dict:
+    """
+    Attempts to claim the daily reward.
+
+    Returns a dict:
+      {
+        "success": bool,
+        "reason": str | None,         # "cooldown" if too early
+        "seconds_left": int | None,   # if cooldown
+        "coins_awarded": int | None,
+        "new_streak": int | None,
+        "new_balance": int | None,
+      }
+    """
+    COOLDOWN = 24 * 60 * 60  # 24 hours in seconds
+    BASE_REWARD = 3
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT joindev_coins, daily_streak, last_daily FROM joindev.users WHERE user_id = $1 FOR UPDATE",
+                user_id,
+            )
+            if not row:
+                return {"success": False, "reason": "no_user"}
+
+            last_daily = row["last_daily"] or 0
+            streak = row["daily_streak"] or 0
+            balance = row["joindev_coins"] or 0
+            elapsed = now - last_daily
+
+            if elapsed < COOLDOWN:
+                return {
+                    "success": False,
+                    "reason": "cooldown",
+                    "seconds_left": COOLDOWN - elapsed,
+                }
+
+            # Streak logic: if they claimed within 48h, streak continues.
+            # If more than 48h, reset to 1.
+            if elapsed < COOLDOWN * 2:
+                new_streak = streak + 1
+            else:
+                new_streak = 1
+
+            # Reward: 3 base + bonus equal to (streak - 1)
+            coins_awarded = BASE_REWARD + (new_streak - 1)
+            new_balance = balance + coins_awarded
+
+            await conn.execute("""
+                UPDATE joindev.users
+                SET joindev_coins = $2, daily_streak = $3, last_daily = $4
+                WHERE user_id = $1
+            """, user_id, new_balance, new_streak, now)
+
+            return {
+                "success": True,
+                "coins_awarded": coins_awarded,
+                "new_streak": new_streak,
+                "new_balance": new_balance,
+            }
