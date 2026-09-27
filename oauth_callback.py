@@ -1,40 +1,31 @@
 """
-oauth_callback.py — Handles Discord OAuth2 callback
-Exchanges the authorization code for a user access token,
-stores the user in Postgres, and queues the welcome DM.
+oauth_callback.py — Discord OAuth2 callback
+Exchanges the code for tokens, stores the user, and queues the welcome DM.
 """
 
 import os
 import time
+import asyncio
 import logging
 
 import requests
 from flask import Flask, request, jsonify
 
-from database import init_db, upsert_user
+from database import upsert_user
 
 log = logging.getLogger("joindev.oauth")
 
-# ---------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 
 API_ENDPOINT = "https://discord.com/api/v10"
-
 oauth_app = Flask(__name__)
 
-# Welcome DM queue file (read by bot.py)
 WELCOME_QUEUE_FILE = "/tmp/joindev_welcome_queue.txt"
 
 
-# ---------------------------------------------------------------
-# TOKEN EXCHANGE
-# ---------------------------------------------------------------
 def exchange_code(code: str) -> dict | None:
-    """Exchanges an authorization code for an access token."""
     data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -43,47 +34,30 @@ def exchange_code(code: str) -> dict | None:
         "redirect_uri": REDIRECT_URI,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     try:
-        response = requests.post(
-            f"{API_ENDPOINT}/oauth2/token",
-            data=data,
-            headers=headers,
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
+        r = requests.post(f"{API_ENDPOINT}/oauth2/token", data=data, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
     except requests.RequestException as e:
         log.error(f"Token exchange failed: {e}")
         return None
 
 
-def fetch_user_id(access_token: str) -> str | None:
-    """Fetches the authenticated user's Discord ID."""
+def fetch_user_id(access_token: str) -> int | None:
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        response = requests.get(
-            f"{API_ENDPOINT}/users/@me",
-            headers=headers,
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json().get("id")
+        r = requests.get(f"{API_ENDPOINT}/users/@me", headers=headers, timeout=10)
+        r.raise_for_status()
+        return int(r.json().get("id"))
     except requests.RequestException as e:
         log.error(f"Failed to fetch user: {e}")
         return None
 
 
-# ---------------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------------
 @oauth_app.route("/callback")
 def callback():
-    """Discord redirects here after the user authorizes."""
     code = request.args.get("code")
-
     if not code:
-        log.warning("Callback hit without a code parameter.")
         return jsonify({"error": "missing_code"}), 400
 
     token_data = exchange_code(code)
@@ -92,44 +66,43 @@ def callback():
 
     access_token = token_data.get("access_token")
     refresh_token = token_data.get("refresh_token")
-    expires_in = token_data.get("expires_in", 604800)  # 7 days default
+    expires_in = token_data.get("expires_in", 604800)
     expires_at = int(time.time()) + expires_in
 
     user_id = fetch_user_id(access_token)
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    log.info(f"OAuth complete for user {user_id}")
-
-    # Store user in Postgres
+    # Run the async DB write inside a fresh event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        upsert_user(user_id, access_token, refresh_token, expires_at)
-        log.info(f"Stored user {user_id} in database")
-    except Exception as e:
-        log.error(f"Database error for {user_id}: {e}")
-        return jsonify({"error": "database_error"}), 500
+        loop.run_until_complete(upsert_user(user_id, access_token, refresh_token, expires_at))
+    finally:
+        loop.close()
 
-    # Queue the welcome DM for the bot to send
-    _queue_welcome_dm(user_id)
+    # Queue the welcome DM
+    try:
+        with open(WELCOME_QUEUE_FILE, "a") as f:
+            f.write(f"{user_id}\n")
+    except IOError as e:
+        log.error(f"Failed to queue welcome DM: {e}")
 
     return """
     <!DOCTYPE html>
     <html>
-    <head><title>JoinDev — Authorized</title></head>
-    <body style="background:#0b0d12;color:#e6e9ef;font-family:sans-serif;text-align:center;padding:60px;">
-        <h1 style="color:#5865F2;">✅ Authorized!</h1>
-        <p>Check your Discord DMs — I just sent you a welcome message.</p>
-        <p><a href="https://XPchungis44.github.io/JoinDev/" style="color:#7c85ff;">← Back to JoinDev</a></p>
+    <head>
+        <title>JoinDev — Authorized</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    </head>
+    <body style="background:#0b0d12;color:#e6e9ef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;text-align:center;padding:80px 24px;">
+        <h1 style="color:#5865F2;font-size:2rem;">✅ Authorized!</h1>
+        <p style="color:#8b93a7;">Check your Discord DMs — I just sent you a welcome message.</p>
+        <p style="margin-top:32px;">
+            <a href="https://XPchungis44.github.io/JoinDev/" style="color:#7c85ff;text-decoration:none;font-weight:600;">
+                ← Back to JoinDev
+            </a>
+        </p>
     </body>
     </html>
     """, 200
-
-
-def _queue_welcome_dm(user_id: str):
-    """Appends a user ID to the welcome queue file."""
-    try:
-        with open(WELCOME_QUEUE_FILE, "a") as f:
-            f.write(f"{user_id}\n")
-        log.info(f"Queued welcome DM for user {user_id}")
-    except IOError as e:
-        log.error(f"Failed to queue welcome DM: {e}")
