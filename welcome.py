@@ -1,19 +1,15 @@
 """
 welcome.py — JoinDev welcome DM embed
-Edit the copy here without touching bot.py
 """
 
 import discord
 
 
 def build_welcome_embed() -> discord.Embed:
-    """
-    Returns the welcome embed sent to users after OAuth authorization.
-    """
     embed = discord.Embed(
         title="👋 Welcome to JoinDev!",
         description="*Server growth made easy!*",
-        color=0x5865F2,  # Discord blurple
+        color=0x5865F2,
     )
 
     embed.add_field(
@@ -54,5 +50,4 @@ def build_welcome_embed() -> discord.Embed:
     )
 
     embed.set_footer(text="JoinDev • Beta • Server growth made easy!")
-
     return embed
