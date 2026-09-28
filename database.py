@@ -86,6 +86,16 @@ async def init_pool():
             ON joindev.active_joins (rewarded, left_early, joined_at)
         """)
 
+        # Pending welcome DM queue (replaces /tmp file)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS joindev.pending_welcome (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                sent       BOOLEAN DEFAULT FALSE
+            )
+        """)
+
     log.info("Database pool ready, schema initialized.")
 
 
@@ -329,3 +339,35 @@ async def get_user_active_joins(user_id: int) -> list[dict]:
             WHERE user_id = $1 AND rewarded = FALSE AND left_early = FALSE
         """, user_id)
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------
+# PENDING WELCOME DM QUEUE
+# ---------------------------------------------------------------
+async def queue_welcome_dm(user_id: int):
+    """Inserts a pending welcome DM row for the bot to process."""
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO joindev.pending_welcome (user_id, created_at)
+            VALUES ($1, $2)
+        """, user_id, int(time.time()))
+
+
+async def get_pending_welcome_dms() -> list[dict]:
+    """Returns all unsent pending welcome DMs, oldest first."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM joindev.pending_welcome
+            WHERE sent = FALSE
+            ORDER BY created_at ASC
+            LIMIT 50
+        """)
+        return [dict(r) for r in rows]
+
+
+async def mark_welcome_sent(pending_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.pending_welcome SET sent = TRUE WHERE id = $1",
+            pending_id,
+        )
