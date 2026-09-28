@@ -11,7 +11,6 @@ import threading
 from flask import Flask, jsonify
 
 from oauth_callback import oauth_bp
-from database import init_pool
 
 log = logging.getLogger("joindev")
 
@@ -25,6 +24,7 @@ health_app = Flask(__name__)
 def health():
     return jsonify({"status": "ok"}), 200
 
+
 @health_app.route("/")
 def root():
     return jsonify({
@@ -32,6 +32,8 @@ def root():
         "service": "JoinDev Bot",
         "message": "Server growth made easy!"
     }), 200
+
+
 health_app.register_blueprint(oauth_bp)
 
 
@@ -52,13 +54,7 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Init DB pool ONCE on the bot's eventual loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(init_pool())
-    # Do NOT close this loop — the bot will reuse it
-
-    # Start the bot on that same loop
+    # Start the bot — it will init the DB pool on its own loop
     threading.Thread(target=start_bot, daemon=True).start()
 
     # Run Flask on Render's port (blocking)
