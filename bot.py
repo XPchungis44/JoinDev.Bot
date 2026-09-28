@@ -3,7 +3,6 @@ bot.py — JoinDev Discord bot (commands + background tasks)
 """
 
 import os
-import json
 import time
 import logging
 
@@ -13,7 +12,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from welcome import build_welcome_embed
-from oauth_callback import WELCOME_QUEUE_FILE, TOKEN_QUEUE_FILE
 from database import (
     init_pool,
     get_pool,
@@ -33,6 +31,8 @@ from database import (
     add_coins,
     get_all_users,
     update_tokens,
+    get_pending_welcome_dms,
+    mark_welcome_sent,
     THREE_DAYS,
 )
 
@@ -67,56 +67,37 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# QUEUE WATCHER
+# WELCOME DM QUEUE WATCHER (Postgres-backed)
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
-    if os.path.exists(TOKEN_QUEUE_FILE):
-        try:
-            with open(TOKEN_QUEUE_FILE, "r") as f:
-                lines = [l.strip() for l in f if l.strip()]
-            if lines:
-                open(TOKEN_QUEUE_FILE, "w").close()
-
-            for line in lines:
-                try:
-                    entry = json.loads(line)
-                    user_id = entry["user_id"]
-                    await upsert_user(
-                        user_id,
-                        entry["access_token"],
-                        entry["refresh_token"],
-                        entry["expires_at"],
-                    )
-                    log.info(f"Stored tokens for user {user_id}")
-                    await _add_to_support_server(user_id)
-                except json.JSONDecodeError as e:
-                    log.error(f"Bad token JSON: {e}")
-                except Exception as e:
-                    log.error(f"Failed to store tokens: {e}")
-        except IOError as e:
-            log.error(f"Token queue read error: {e}")
-
-    if not os.path.exists(WELCOME_QUEUE_FILE):
-        return
     try:
-        with open(WELCOME_QUEUE_FILE, "r") as f:
-            user_ids = [line.strip() for line in f if line.strip()]
-        if not user_ids:
-            return
-        open(WELCOME_QUEUE_FILE, "w").close()
+        pending = await get_pending_welcome_dms()
+    except Exception as e:
+        log.error(f"Failed to fetch pending welcome DMs: {e}")
+        return
 
-        for uid in user_ids:
-            try:
-                user = await bot.fetch_user(int(uid))
-                await user.send(embed=build_welcome_embed())
-                log.info(f"Welcome DM sent to {uid}")
-            except discord.Forbidden:
-                log.warning(f"Cannot DM {uid} — DMs closed.")
-            except discord.HTTPException as e:
-                log.error(f"DM to {uid} failed: {e}")
-    except IOError as e:
-        log.error(f"Queue read error: {e}")
+    if not pending:
+        return
+
+    log.info(f"Processing {len(pending)} pending welcome DM(s)")
+
+    for row in pending:
+        user_id = row["user_id"]
+        try:
+            user = await bot.fetch_user(user_id)
+            await user.send(embed=build_welcome_embed())
+            log.info(f"Welcome DM sent to {user_id}")
+
+            # Add to support server (best effort)
+            await _add_to_support_server(user_id)
+
+            await mark_welcome_sent(row["id"])
+        except discord.Forbidden:
+            log.warning(f"Cannot DM {user_id} — DMs closed. Marking as sent anyway.")
+            await mark_welcome_sent(row["id"])
+        except discord.HTTPException as e:
+            log.error(f"DM to {user_id} failed: {e}")
 
 
 async def _add_to_support_server(user_id: int):
@@ -125,6 +106,7 @@ async def _add_to_support_server(user_id: int):
         log.warning(f"Bot not in support server {SUPPORT_SERVER_ID}")
         return
     if guild.get_member(user_id) is not None:
+        log.info(f"User {user_id} already in support server")
         return
     try:
         user = await bot.fetch_user(user_id)
@@ -642,6 +624,9 @@ async def admin_check(ctx: commands.Context):
             completed_orders = await conn.fetchval(
                 "SELECT COUNT(*) FROM joindev.orders WHERE status = 'completed'"
             )
+            pending_welcome = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.pending_welcome WHERE sent = FALSE"
+            )
     except Exception as e:
         await ctx.send(f"❌ **DB error:** `{type(e).__name__}: {e}`")
         log.error(f".check failed: {e}")
@@ -654,6 +639,7 @@ async def admin_check(ctx: commands.Context):
     embed.add_field(name="🔗 Pending Joins", value=f"**{active_joins}**", inline=True)
     embed.add_field(name="🌐 Active Servers", value=f"**{total_servers}**", inline=True)
     embed.add_field(name="🪙 Total JoinCoins Held", value=f"**{total_coins}**", inline=True)
+    embed.add_field(name="📨 Pending Welcome DMs", value=f"**{pending_welcome}**", inline=True)
     await ctx.send(embed=embed)
 
 
