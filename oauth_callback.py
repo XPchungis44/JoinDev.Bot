@@ -1,6 +1,7 @@
 """
 oauth_callback.py — Discord OAuth2 callback
-Exchanges the code for tokens, stores the user, and queues the welcome DM.
+Exchanges the code for tokens and stores them via a fresh asyncpg connection.
+Does not touch the shared pool (which lives on the bot's event loop).
 """
 
 import os
@@ -8,16 +9,16 @@ import time
 import asyncio
 import logging
 
+import asyncpg
 import requests
 from flask import Blueprint, request, jsonify
-
-from database import upsert_user, queue_welcome_dm
 
 log = logging.getLogger("joindev.oauth")
 
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 API_ENDPOINT = "https://discord.com/api/v10"
 
@@ -53,6 +54,27 @@ def fetch_user_id(access_token: str) -> int | None:
         return None
 
 
+async def _store_user(user_id, access_token, refresh_token, expires_at):
+    """Writes to Postgres using a one-off connection, not the shared pool."""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
+            INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                token_expires_at = EXCLUDED.token_expires_at
+        """, user_id, access_token, refresh_token, expires_at)
+
+        await conn.execute("""
+            INSERT INTO joindev.pending_welcome (user_id, created_at)
+            VALUES ($1, $2)
+        """, user_id, int(time.time()))
+    finally:
+        await conn.close()
+
+
 @oauth_bp.route("/callback")
 def callback():
     code = request.args.get("code")
@@ -72,15 +94,16 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    # Use a temporary event loop for the async DB calls
+    # Use a fresh event loop for the one-off connection
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(upsert_user(user_id, access_token, refresh_token, expires_at))
-        loop.run_until_complete(queue_welcome_dm(user_id))
+        loop.run_until_complete(
+            _store_user(user_id, access_token, refresh_token, expires_at)
+        )
     except Exception as e:
-        log.error(f"DB write failed for {user_id}: {e}")
-        return jsonify({"error": "database_error"}), 500
+        log.error(f"DB write failed for {user_id}: {type(e).__name__}: {e}")
+        return jsonify({"error": "database_error", "detail": str(e)}), 500
     finally:
         loop.close()
 
