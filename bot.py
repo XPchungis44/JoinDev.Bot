@@ -14,14 +14,13 @@ from discord.ext import commands, tasks
 from welcome import build_welcome_embed
 from oauth_callback import WELCOME_QUEUE_FILE
 from database import (
+    init_pool,
     get_user,
     claim_daily,
     set_do_not_join,
     add_server,
-    remove_server,
     get_active_servers,
     create_order,
-    get_order,
     increment_order_completed,
     complete_order,
     create_active_join,
@@ -49,6 +48,16 @@ INSTALL_URL = (
     "&scope=bot+applications.commands"
     "&permissions=8"
 )
+
+
+# ---------------------------------------------------------------
+# SETUP HOOK — runs on the bot's event loop before connecting
+# ---------------------------------------------------------------
+@bot.event
+async def setup_hook():
+    log.info("Initializing database pool on bot's event loop...")
+    await init_pool()
+    log.info("Database pool ready.")
 
 
 # ---------------------------------------------------------------
@@ -154,11 +163,10 @@ async def _leave_guild(guild_id: int):
 
 
 # ---------------------------------------------------------------
-# TOKEN REFRESH TASK (runs on bot's event loop)
+# TOKEN REFRESH TASK
 # ---------------------------------------------------------------
 @tasks.loop(hours=12)
 async def refresh_tokens():
-    """Refreshes Discord OAuth tokens that are close to expiring."""
     client_id = os.getenv("DISCORD_CLIENT_ID")
     client_secret = os.getenv("DISCORD_CLIENT_SECRET")
     now = int(time.time())
@@ -372,7 +380,7 @@ async def submit_server(interaction: discord.Interaction, invite: str):
 
 
 # ---------------------------------------------------------------
-# AUTO JOIN (user farming side)
+# AUTO JOIN
 # ---------------------------------------------------------------
 @bot.tree.command(name="auto_join", description="Spend JoinCoins to farm servers.")
 @app_commands.describe(amount="How many JoinCoins to spend, or 'max' to spend everything")
@@ -469,7 +477,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
 
 
 # ---------------------------------------------------------------
-# BUY MEMBERS (server owner side)
+# BUY MEMBERS
 # ---------------------------------------------------------------
 @bot.tree.command(name="buy_members", description="Spend JoinCoins to bring members to your server.")
 @app_commands.describe(amount="How many members you want, or 'max'")
