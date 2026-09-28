@@ -16,6 +16,8 @@ if not DATABASE_URL:
 
 _pool: asyncpg.Pool | None = None
 
+THREE_DAYS = 3 * 24 * 60 * 60  # 259200 seconds
+
 
 async def init_pool():
     """Creates the connection pool and initializes the schema."""
@@ -24,6 +26,8 @@ async def init_pool():
 
     async with _pool.acquire() as conn:
         await conn.execute("CREATE SCHEMA IF NOT EXISTS joindev")
+
+        # Users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.users (
                 user_id          BIGINT PRIMARY KEY,
@@ -36,6 +40,52 @@ async def init_pool():
                 do_not_join      INTEGER DEFAULT 0
             )
         """)
+
+        # Server pool
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS joindev.server_pool (
+                guild_id     BIGINT PRIMARY KEY,
+                owner_id     BIGINT NOT NULL,
+                invite_code  TEXT,
+                added_at     BIGINT NOT NULL,
+                active       BOOLEAN DEFAULT TRUE
+            )
+        """)
+
+        # Orders
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS joindev.orders (
+                order_id           SERIAL PRIMARY KEY,
+                guild_id           BIGINT NOT NULL,
+                owner_id           BIGINT NOT NULL,
+                members_requested  INTEGER NOT NULL,
+                members_completed  INTEGER DEFAULT 0,
+                coins_spent        INTEGER NOT NULL,
+                created_at         BIGINT NOT NULL,
+                completed_at       BIGINT,
+                status             TEXT DEFAULT 'active'
+            )
+        """)
+
+        # Active joins
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS joindev.active_joins (
+                id           SERIAL PRIMARY KEY,
+                user_id      BIGINT NOT NULL,
+                guild_id     BIGINT NOT NULL,
+                order_id     INTEGER,
+                joined_at    BIGINT NOT NULL,
+                rewarded     BOOLEAN DEFAULT FALSE,
+                left_early   BOOLEAN DEFAULT FALSE,
+                checked_at   BIGINT
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_active_joins_pending
+            ON joindev.active_joins (rewarded, left_early, joined_at)
+        """)
+
     log.info("Database pool ready, schema initialized.")
 
 
@@ -46,8 +96,10 @@ async def close_pool():
         _pool = None
 
 
+# ---------------------------------------------------------------
+# USERS
+# ---------------------------------------------------------------
 async def upsert_user(user_id: int, access_token: str, refresh_token: str, expires_at: int):
-    """Inserts a new user or updates their tokens."""
     async with _pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at)
@@ -88,6 +140,18 @@ async def update_coins(user_id: int, coins: int):
         )
 
 
+async def add_coins(user_id: int, amount: int) -> int:
+    """Atomically adds coins. Returns new balance."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE joindev.users
+            SET joindev_coins = joindev_coins + $2
+            WHERE user_id = $1
+            RETURNING joindev_coins
+        """, user_id, amount)
+        return row["joindev_coins"] if row else 0
+
+
 async def set_do_not_join(user_id: int, flag: bool):
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -97,20 +161,7 @@ async def set_do_not_join(user_id: int, flag: bool):
 
 
 async def claim_daily(user_id: int, now: int) -> dict:
-    """
-    Attempts to claim the daily reward.
-
-    Returns a dict:
-      {
-        "success": bool,
-        "reason": str | None,         # "cooldown" if too early
-        "seconds_left": int | None,   # if cooldown
-        "coins_awarded": int | None,
-        "new_streak": int | None,
-        "new_balance": int | None,
-      }
-    """
-    COOLDOWN = 24 * 60 * 60  # 24 hours in seconds
+    COOLDOWN = 24 * 60 * 60
     BASE_REWARD = 3
 
     async with _pool.acquire() as conn:
@@ -128,20 +179,9 @@ async def claim_daily(user_id: int, now: int) -> dict:
             elapsed = now - last_daily
 
             if elapsed < COOLDOWN:
-                return {
-                    "success": False,
-                    "reason": "cooldown",
-                    "seconds_left": COOLDOWN - elapsed,
-                }
+                return {"success": False, "reason": "cooldown", "seconds_left": COOLDOWN - elapsed}
 
-            # Streak logic: if they claimed within 48h, streak continues.
-            # If more than 48h, reset to 1.
-            if elapsed < COOLDOWN * 2:
-                new_streak = streak + 1
-            else:
-                new_streak = 1
-
-            # Reward: 3 base + bonus equal to (streak - 1)
+            new_streak = streak + 1 if elapsed < COOLDOWN * 2 else 1
             coins_awarded = BASE_REWARD + (new_streak - 1)
             new_balance = balance + coins_awarded
 
@@ -157,3 +197,128 @@ async def claim_daily(user_id: int, now: int) -> dict:
                 "new_streak": new_streak,
                 "new_balance": new_balance,
             }
+
+
+# ---------------------------------------------------------------
+# SERVER POOL
+# ---------------------------------------------------------------
+async def add_server(guild_id: int, owner_id: int, invite_code: str, now: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO joindev.server_pool (guild_id, owner_id, invite_code, added_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                invite_code = EXCLUDED.invite_code,
+                owner_id = EXCLUDED.owner_id,
+                active = TRUE
+        """, guild_id, owner_id, invite_code, now)
+
+
+async def remove_server(guild_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.server_pool SET active = FALSE WHERE guild_id = $1",
+            guild_id,
+        )
+
+
+async def get_active_servers(exclude_guild_ids: list[int] = None) -> list[dict]:
+    async with _pool.acquire() as conn:
+        if exclude_guild_ids:
+            rows = await conn.fetch("""
+                SELECT * FROM joindev.server_pool
+                WHERE active = TRUE AND guild_id <> ALL($1::bigint[])
+            """, exclude_guild_ids)
+        else:
+            rows = await conn.fetch("SELECT * FROM joindev.server_pool WHERE active = TRUE")
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------
+# ORDERS
+# ---------------------------------------------------------------
+async def create_order(guild_id: int, owner_id: int, members: int, coins: int, now: int) -> int:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO joindev.orders
+                (guild_id, owner_id, members_requested, coins_spent, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING order_id
+        """, guild_id, owner_id, members, coins, now)
+        return row["order_id"]
+
+
+async def get_order(order_id: int) -> dict | None:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM joindev.orders WHERE order_id = $1", order_id)
+        return dict(row) if row else None
+
+
+async def increment_order_completed(order_id: int) -> dict:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE joindev.orders
+            SET members_completed = members_completed + 1
+            WHERE order_id = $1
+            RETURNING *
+        """, order_id)
+        return dict(row) if row else {}
+
+
+async def complete_order(order_id: int, now: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE joindev.orders
+            SET status = 'completed', completed_at = $2
+            WHERE order_id = $1
+        """, order_id, now)
+
+
+# ---------------------------------------------------------------
+# ACTIVE JOINS
+# ---------------------------------------------------------------
+async def create_active_join(user_id: int, guild_id: int, order_id: int | None, now: int) -> int:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO joindev.active_joins (user_id, guild_id, order_id, joined_at)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        """, user_id, guild_id, order_id, now)
+        return row["id"]
+
+
+async def get_pending_joins() -> list[dict]:
+    cutoff = int(time.time()) - THREE_DAYS
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM joindev.active_joins
+            WHERE rewarded = FALSE
+              AND left_early = FALSE
+              AND joined_at <= $1
+        """, cutoff)
+        return [dict(r) for r in rows]
+
+
+async def mark_join_rewarded(join_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.active_joins SET rewarded = TRUE, checked_at = $2 WHERE id = $1",
+            join_id, int(time.time()),
+        )
+
+
+async def mark_join_left_early(join_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.active_joins SET left_early = TRUE, checked_at = $2 WHERE id = $1",
+            join_id, int(time.time()),
+        )
+
+
+async def get_user_active_joins(user_id: int) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM joindev.active_joins
+            WHERE user_id = $1 AND rewarded = FALSE AND left_early = FALSE
+        """, user_id)
+        return [dict(r) for r in rows]
