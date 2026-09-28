@@ -1,7 +1,7 @@
 """
 oauth_callback.py — Discord OAuth2 callback
-Exchanges the code for tokens and stores them via a fresh asyncpg connection.
-Does not touch the shared pool (which lives on the bot's event loop).
+Exchanges code for tokens, stores user, queues welcome DM.
+Uses a one-off asyncpg connection (not the shared pool) to avoid loop conflicts.
 """
 
 import os
@@ -39,7 +39,7 @@ def exchange_code(code: str) -> dict | None:
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
-        log.error(f"Token exchange failed: {e}")
+        log.error(f"exchange_code: failed — {e}")
         return None
 
 
@@ -50,12 +50,13 @@ def fetch_user_id(access_token: str) -> int | None:
         r.raise_for_status()
         return int(r.json().get("id"))
     except requests.RequestException as e:
-        log.error(f"Failed to fetch user: {e}")
+        log.error(f"fetch_user_id: failed — {e}")
         return None
 
 
 async def _store_user(user_id, access_token, refresh_token, expires_at):
     """Writes to Postgres using a one-off connection, not the shared pool."""
+    log.info(f"_store_user: connecting to DB for user {user_id}")
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("""
@@ -66,19 +67,23 @@ async def _store_user(user_id, access_token, refresh_token, expires_at):
                 refresh_token = EXCLUDED.refresh_token,
                 token_expires_at = EXCLUDED.token_expires_at
         """, user_id, access_token, refresh_token, expires_at)
+        log.info(f"_store_user: upserted user {user_id}")
 
         await conn.execute("""
             INSERT INTO joindev.pending_welcome (user_id, created_at)
             VALUES ($1, $2)
         """, user_id, int(time.time()))
+        log.info(f"_store_user: queued welcome DM for {user_id}")
     finally:
         await conn.close()
 
 
 @oauth_bp.route("/callback")
 def callback():
+    log.info("callback: hit")
     code = request.args.get("code")
     if not code:
+        log.warning("callback: missing code")
         return jsonify({"error": "missing_code"}), 400
 
     token_data = exchange_code(code)
@@ -94,7 +99,8 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    # Use a fresh event loop for the one-off connection
+    log.info(f"callback: got user_id {user_id}")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -102,12 +108,12 @@ def callback():
             _store_user(user_id, access_token, refresh_token, expires_at)
         )
     except Exception as e:
-        log.error(f"DB write failed for {user_id}: {type(e).__name__}: {e}")
+        log.error(f"callback: DB write failed for {user_id} — {type(e).__name__}: {e}")
         return jsonify({"error": "database_error", "detail": str(e)}), 500
     finally:
         loop.close()
 
-    log.info(f"Stored user {user_id} and queued welcome DM")
+    log.info(f"callback: ✅ complete for {user_id}")
 
     return """
     <!DOCTYPE html>
