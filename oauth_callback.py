@@ -9,7 +9,7 @@ import asyncio
 import logging
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Blueprint, request, jsonify
 
 from database import upsert_user
 
@@ -20,7 +20,9 @@ CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 
 API_ENDPOINT = "https://discord.com/api/v10"
-oauth_app = Flask(__name__)
+
+# Use a Blueprint, not a Flask app
+oauth_bp = Blueprint("oauth", __name__)
 
 WELCOME_QUEUE_FILE = "/tmp/joindev_welcome_queue.txt"
 
@@ -54,7 +56,7 @@ def fetch_user_id(access_token: str) -> int | None:
         return None
 
 
-@oauth_app.route("/callback")
+@oauth_bp.route("/callback")
 def callback():
     code = request.args.get("code")
     if not code:
@@ -73,7 +75,6 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    # Run the async DB write inside a fresh event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -81,7 +82,6 @@ def callback():
     finally:
         loop.close()
 
-    # Queue the welcome DM
     try:
         with open(WELCOME_QUEUE_FILE, "a") as f:
             f.write(f"{user_id}\n")
