@@ -61,30 +61,31 @@ ADMIN_USER_ID = 1459373221756538923
 # ---------------------------------------------------------------
 @bot.event
 async def setup_hook():
-    log.info("Initializing database pool on bot's event loop...")
+    log.info("setup_hook: initializing DB pool...")
     await init_pool()
-    log.info("Database pool ready.")
+    log.info("setup_hook: DB pool ready.")
 
 
 # ---------------------------------------------------------------
 # WELCOME DM QUEUE WATCHER (Postgres-backed)
-# Order: support server add → DM → mark sent
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
+    log.info("watch_welcome_queue: tick")
     try:
         pending = await get_pending_welcome_dms()
     except Exception as e:
-        log.error(f"Failed to fetch pending welcome DMs: {type(e).__name__}: {e}")
+        log.error(f"watch_welcome_queue: fetch failed — {type(e).__name__}: {e}")
         return
+
+    log.info(f"watch_welcome_queue: {len(pending)} pending")
 
     if not pending:
         return
 
-    log.info(f"Processing {len(pending)} pending welcome DM(s)")
-
     for row in pending:
         user_id = row["user_id"]
+        log.info(f"watch_welcome_queue: processing user {user_id} (row id {row['id']})")
 
         # 1. Add to support server FIRST
         await _add_to_support_server(user_id)
@@ -93,52 +94,52 @@ async def watch_welcome_queue():
         try:
             user = await bot.fetch_user(user_id)
             await user.send(embed=build_welcome_embed())
-            log.info(f"Welcome DM sent to {user_id}")
+            log.info(f"watch_welcome_queue: ✅ DM sent to {user_id}")
         except discord.Forbidden:
-            log.warning(f"Cannot DM {user_id} — DMs closed.")
+            log.warning(f"watch_welcome_queue: ❌ Cannot DM {user_id} — DMs closed.")
         except discord.HTTPException as e:
-            log.error(f"DM to {user_id} failed: {e}")
+            log.error(f"watch_welcome_queue: ❌ DM failed for {user_id}: {e}")
 
-        # 3. Mark as done regardless — we don't want infinite retries
-        await mark_welcome_sent(row["id"])
+        # 3. Mark as done regardless
+        try:
+            await mark_welcome_sent(row["id"])
+            log.info(f"watch_welcome_queue: marked row {row['id']} as sent")
+        except Exception as e:
+            log.error(f"watch_welcome_queue: failed to mark row {row['id']}: {e}")
 
 
 async def _add_to_support_server(user_id: int):
     """Adds a user to the support server. Logs every step for debugging."""
     guild = bot.get_guild(SUPPORT_SERVER_ID)
     if not guild:
-        log.warning(f"Bot is NOT in support server {SUPPORT_SERVER_ID} — cannot add user {user_id}")
+        log.warning(f"support_server: bot NOT in guild {SUPPORT_SERVER_ID}")
         return
 
     if guild.get_member(user_id) is not None:
-        log.info(f"User {user_id} is already in the support server")
+        log.info(f"support_server: user {user_id} already in guild")
         return
 
-    # Check the bot's own permissions in that guild
     me = guild.me
     if me is None:
-        log.warning(f"Could not resolve bot member in support server {SUPPORT_SERVER_ID}")
+        log.warning(f"support_server: could not resolve bot member")
         return
 
     perms = me.guild_permissions
     log.info(
-        f"Bot permissions in support server — "
-        f"create_instant_invite={perms.create_instant_invite}, "
+        f"support_server: bot perms — "
+        f"invite={perms.create_instant_invite}, "
         f"manage_guild={perms.manage_guild}, "
-        f"administrator={perms.administrator}"
+        f"admin={perms.administrator}"
     )
 
     try:
         user = await bot.fetch_user(user_id)
         await guild.add_member(user, reason="JoinDev authorization")
-        log.info(f"✅ Added user {user_id} to support server")
+        log.info(f"support_server: ✅ added {user_id}")
     except discord.Forbidden as e:
-        log.error(
-            f"❌ Forbidden adding {user_id} to support server. "
-            f"Bot needs 'Create Invite' and 'Manage Server' permissions. Error: {e}"
-        )
+        log.error(f"support_server: ❌ Forbidden adding {user_id}: {e}")
     except discord.HTTPException as e:
-        log.error(f"❌ HTTPException adding {user_id} to support server: {e}")
+        log.error(f"support_server: ❌ HTTPException adding {user_id}: {e}")
 
 
 # ---------------------------------------------------------------
@@ -150,7 +151,7 @@ async def check_join_rewards():
     if not pending:
         return
 
-    log.info(f"Checking {len(pending)} pending joins")
+    log.info(f"check_join_rewards: {len(pending)} pending joins")
 
     for join in pending:
         user_id = join["user_id"]
@@ -198,20 +199,20 @@ async def check_join_rewards():
                     await _leave_guild(guild_id)
 
         except Exception as e:
-            log.error(f"Error processing join {join['id']}: {e}")
+            log.error(f"check_join_rewards: error on join {join['id']}: {e}")
 
 
 async def _leave_guild(guild_id: int):
     if guild_id == SUPPORT_SERVER_ID:
-        log.warning(f"Refusing to leave support server {guild_id}")
+        log.warning(f"leave_guild: refusing to leave support server")
         return
     guild = bot.get_guild(guild_id)
     if guild:
         try:
             await guild.leave()
-            log.info(f"Bot left guild {guild_id} after order completion")
+            log.info(f"leave_guild: left {guild_id}")
         except discord.HTTPException as e:
-            log.error(f"Failed to leave guild {guild_id}: {e}")
+            log.error(f"leave_guild: failed — {e}")
 
 
 # ---------------------------------------------------------------
@@ -247,9 +248,9 @@ async def refresh_tokens():
                 u["user_id"], new["access_token"], new["refresh_token"],
                 int(time.time()) + new.get("expires_in", 604800),
             )
-            log.info(f"Refreshed tokens for {u['user_id']}")
+            log.info(f"refresh_tokens: refreshed {u['user_id']}")
         except Exception as e:
-            log.error(f"Refresh failed for {u['user_id']}: {e}")
+            log.error(f"refresh_tokens: failed for {u['user_id']}: {e}")
 
 
 # ---------------------------------------------------------------
@@ -257,20 +258,30 @@ async def refresh_tokens():
 # ---------------------------------------------------------------
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    log.info(f"In {len(bot.guilds)} guild(s)")
+    log.info(f"on_ready: logged in as {bot.user} (ID: {bot.user.id})")
+    log.info(f"on_ready: in {len(bot.guilds)} guild(s)")
+    for g in bot.guilds:
+        log.info(f"on_ready: guild → {g.name} ({g.id})")
+
     try:
         synced = await bot.tree.sync()
-        log.info(f"Synced {len(synced)} slash commands")
+        log.info(f"on_ready: synced {len(synced)} slash commands")
     except Exception as e:
-        log.error(f"Slash sync failed: {e}")
+        log.error(f"on_ready: slash sync failed: {e}")
 
     if not watch_welcome_queue.is_running():
         watch_welcome_queue.start()
+        log.info("on_ready: started watch_welcome_queue")
+    else:
+        log.info("on_ready: watch_welcome_queue already running")
+
     if not check_join_rewards.is_running():
         check_join_rewards.start()
+        log.info("on_ready: started check_join_rewards")
+
     if not refresh_tokens.is_running():
         refresh_tokens.start()
+        log.info("on_ready: started refresh_tokens")
 
 
 # ---------------------------------------------------------------
@@ -472,7 +483,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
             await create_active_join(interaction.user.id, srv["guild_id"], None, int(time.time()))
             joined += 1
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Failed to join {srv['guild_id']}: {e}")
+            log.warning(f"auto_join: failed {srv['guild_id']}: {e}")
             failed += 1
 
     if failed:
@@ -554,7 +565,7 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             )
             added += 1
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Failed to add {c['user_id']}: {e}")
+            log.warning(f"buy_members: failed adding {c['user_id']}: {e}")
 
     await interaction.edit_original_response(
         content=(
@@ -607,7 +618,7 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
             await create_active_join(uid, guild.id, None, int(time.time()))
             added += 1
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Failed {uid}: {e}")
+            log.warning(f"admin_join: failed {uid}: {e}")
 
     await ctx.send(f"✅ Added **{added}** to **{guild.name}**. Skipped: **{skipped}**")
 
@@ -652,7 +663,7 @@ async def admin_check(ctx: commands.Context):
             )
     except Exception as e:
         await ctx.send(f"❌ **DB error:** `{type(e).__name__}: {e}`")
-        log.error(f".check failed: {e}")
+        log.error(f"admin_check: {e}")
         return
 
     embed = discord.Embed(title="📊 JoinDev Stats", color=0x5865F2)
