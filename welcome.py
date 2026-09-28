@@ -49,5 +49,14 @@ def build_welcome_embed() -> discord.Embed:
         inline=False,
     )
 
+    embed.add_field(
+        name="🛡️ Support Server",
+        value=(
+            "We've also added you to our **official support server** so you can "
+            "get help, ask questions, and stay updated. See you there!"
+        ),
+        inline=False,
+    )
+
     embed.set_footer(text="JoinDev • Beta • Server growth made easy!")
     return embed
