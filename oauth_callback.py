@@ -1,16 +1,17 @@
 """
 oauth_callback.py — Discord OAuth2 callback
-Exchanges the code for tokens, then writes them to a queue file.
-The bot reads the queue and writes to Postgres on its own event loop.
+Exchanges the code for tokens, stores the user, and queues the welcome DM.
 """
 
 import os
 import time
-import json
+import asyncio
 import logging
 
 import requests
 from flask import Blueprint, request, jsonify
+
+from database import upsert_user, queue_welcome_dm
 
 log = logging.getLogger("joindev.oauth")
 
@@ -21,10 +22,6 @@ REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 API_ENDPOINT = "https://discord.com/api/v10"
 
 oauth_bp = Blueprint("oauth", __name__)
-
-# Files read by bot.py
-TOKEN_QUEUE_FILE = "/tmp/joindev_token_queue.jsonl"
-WELCOME_QUEUE_FILE = "/tmp/joindev_welcome_queue.txt"
 
 
 def exchange_code(code: str) -> dict | None:
@@ -75,27 +72,19 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    # Write to token queue — bot will pick this up and insert on its own loop
+    # Use a temporary event loop for the async DB calls
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        entry = {
-            "user_id": user_id,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_at": expires_at,
-        }
-        with open(TOKEN_QUEUE_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        log.info(f"Queued token data for user {user_id}")
-    except IOError as e:
-        log.error(f"Failed to write token queue: {e}")
-        return jsonify({"error": "queue_write_failed"}), 500
+        loop.run_until_complete(upsert_user(user_id, access_token, refresh_token, expires_at))
+        loop.run_until_complete(queue_welcome_dm(user_id))
+    except Exception as e:
+        log.error(f"DB write failed for {user_id}: {e}")
+        return jsonify({"error": "database_error"}), 500
+    finally:
+        loop.close()
 
-    # Queue the welcome DM
-    try:
-        with open(WELCOME_QUEUE_FILE, "a") as f:
-            f.write(f"{user_id}\n")
-    except IOError as e:
-        log.error(f"Failed to queue welcome DM: {e}")
+    log.info(f"Stored user {user_id} and queued welcome DM")
 
     return """
     <!DOCTYPE html>
