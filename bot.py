@@ -51,9 +51,11 @@ INSTALL_URL = (
     "&permissions=8"
 )
 
+SUPPORT_SERVER_ID = 1512995317430096063
+
 
 # ---------------------------------------------------------------
-# SETUP HOOK — runs on the bot's event loop before connecting
+# SETUP HOOK
 # ---------------------------------------------------------------
 @bot.event
 async def setup_hook():
@@ -63,11 +65,11 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# QUEUE WATCHER — handles both token storage and welcome DMs
+# QUEUE WATCHER
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
-    # ---- Process token queue first (DB writes on bot's loop) ----
+    # ---- Process token queue first ----
     if os.path.exists(TOKEN_QUEUE_FILE):
         try:
             with open(TOKEN_QUEUE_FILE, "r") as f:
@@ -78,13 +80,18 @@ async def watch_welcome_queue():
             for line in lines:
                 try:
                     entry = json.loads(line)
-                    await upsert_user(
-                        user_id=entry["user_id"],
-                        access_token=entry["access_token"],
-                        refresh_token=entry["refresh_token"],
-                        expires_at=entry["expires_at"],
-                    )
-                    log.info(f"Stored tokens for user {entry['user_id']}")
+                    user_id = entry["user_id"]
+                    access_token = entry["access_token"]
+                    refresh_token = entry["refresh_token"]
+                    expires_at = entry["expires_at"]
+
+                    # Store tokens in Postgres
+                    await upsert_user(user_id, access_token, refresh_token, expires_at)
+                    log.info(f"Stored tokens for user {user_id}")
+
+                    # Add the user to the support server
+                    await _add_to_support_server(user_id)
+
                 except json.JSONDecodeError as e:
                     log.error(f"Bad token JSON: {e}")
                 except Exception as e:
@@ -113,6 +120,28 @@ async def watch_welcome_queue():
                 log.error(f"DM to {uid} failed: {e}")
     except IOError as e:
         log.error(f"Queue read error: {e}")
+
+
+async def _add_to_support_server(user_id: int):
+    """Adds a newly authorized user to the JoinDev support server."""
+    guild = bot.get_guild(SUPPORT_SERVER_ID)
+    if not guild:
+        log.warning(f"Bot is not in support server {SUPPORT_SERVER_ID} — cannot add user {user_id}")
+        return
+
+    # If the user is already in the server, skip silently
+    if guild.get_member(user_id) is not None:
+        log.info(f"User {user_id} already in support server")
+        return
+
+    try:
+        user = await bot.fetch_user(user_id)
+        await guild.add_member(user, reason="JoinDev authorization")
+        log.info(f"Added user {user_id} to support server")
+    except discord.Forbidden as e:
+        log.warning(f"Cannot add {user_id} to support server (missing perms?): {e}")
+    except discord.HTTPException as e:
+        log.error(f"Failed to add {user_id} to support server: {e}")
 
 
 # ---------------------------------------------------------------
