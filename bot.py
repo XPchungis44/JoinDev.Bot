@@ -68,13 +68,14 @@ async def setup_hook():
 
 # ---------------------------------------------------------------
 # WELCOME DM QUEUE WATCHER (Postgres-backed)
+# Order: support server add → DM → mark sent
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
     try:
         pending = await get_pending_welcome_dms()
     except Exception as e:
-        log.error(f"Failed to fetch pending welcome DMs: {e}")
+        log.error(f"Failed to fetch pending welcome DMs: {type(e).__name__}: {e}")
         return
 
     if not pending:
@@ -84,38 +85,60 @@ async def watch_welcome_queue():
 
     for row in pending:
         user_id = row["user_id"]
+
+        # 1. Add to support server FIRST
+        await _add_to_support_server(user_id)
+
+        # 2. Then send the DM
         try:
             user = await bot.fetch_user(user_id)
             await user.send(embed=build_welcome_embed())
             log.info(f"Welcome DM sent to {user_id}")
-
-            # Add to support server (best effort)
-            await _add_to_support_server(user_id)
-
-            await mark_welcome_sent(row["id"])
         except discord.Forbidden:
-            log.warning(f"Cannot DM {user_id} — DMs closed. Marking as sent anyway.")
-            await mark_welcome_sent(row["id"])
+            log.warning(f"Cannot DM {user_id} — DMs closed.")
         except discord.HTTPException as e:
             log.error(f"DM to {user_id} failed: {e}")
 
+        # 3. Mark as done regardless — we don't want infinite retries
+        await mark_welcome_sent(row["id"])
+
 
 async def _add_to_support_server(user_id: int):
+    """Adds a user to the support server. Logs every step for debugging."""
     guild = bot.get_guild(SUPPORT_SERVER_ID)
     if not guild:
-        log.warning(f"Bot not in support server {SUPPORT_SERVER_ID}")
+        log.warning(f"Bot is NOT in support server {SUPPORT_SERVER_ID} — cannot add user {user_id}")
         return
+
     if guild.get_member(user_id) is not None:
-        log.info(f"User {user_id} already in support server")
+        log.info(f"User {user_id} is already in the support server")
         return
+
+    # Check the bot's own permissions in that guild
+    me = guild.me
+    if me is None:
+        log.warning(f"Could not resolve bot member in support server {SUPPORT_SERVER_ID}")
+        return
+
+    perms = me.guild_permissions
+    log.info(
+        f"Bot permissions in support server — "
+        f"create_instant_invite={perms.create_instant_invite}, "
+        f"manage_guild={perms.manage_guild}, "
+        f"administrator={perms.administrator}"
+    )
+
     try:
         user = await bot.fetch_user(user_id)
         await guild.add_member(user, reason="JoinDev authorization")
-        log.info(f"Added user {user_id} to support server")
+        log.info(f"✅ Added user {user_id} to support server")
     except discord.Forbidden as e:
-        log.warning(f"Cannot add {user_id} to support server: {e}")
+        log.error(
+            f"❌ Forbidden adding {user_id} to support server. "
+            f"Bot needs 'Create Invite' and 'Manage Server' permissions. Error: {e}"
+        )
     except discord.HTTPException as e:
-        log.error(f"Failed to add {user_id}: {e}")
+        log.error(f"❌ HTTPException adding {user_id} to support server: {e}")
 
 
 # ---------------------------------------------------------------
