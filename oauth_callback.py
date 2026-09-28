@@ -1,17 +1,16 @@
 """
 oauth_callback.py — Discord OAuth2 callback
-Exchanges the code for tokens, stores the user, and queues the welcome DM.
+Exchanges the code for tokens, then writes them to a queue file.
+The bot reads the queue and writes to Postgres on its own event loop.
 """
 
 import os
 import time
-import asyncio
+import json
 import logging
 
 import requests
 from flask import Blueprint, request, jsonify
-
-from database import upsert_user
 
 log = logging.getLogger("joindev.oauth")
 
@@ -21,9 +20,10 @@ REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 
 API_ENDPOINT = "https://discord.com/api/v10"
 
-# Use a Blueprint, not a Flask app
 oauth_bp = Blueprint("oauth", __name__)
 
+# Files read by bot.py
+TOKEN_QUEUE_FILE = "/tmp/joindev_token_queue.jsonl"
 WELCOME_QUEUE_FILE = "/tmp/joindev_welcome_queue.txt"
 
 
@@ -75,13 +75,20 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    # Run the async DB write inside a fresh event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # Write to token queue — bot will pick this up and insert on its own loop
     try:
-        loop.run_until_complete(upsert_user(user_id, access_token, refresh_token, expires_at))
-    finally:
-        loop.close()
+        entry = {
+            "user_id": user_id,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+        }
+        with open(TOKEN_QUEUE_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log.info(f"Queued token data for user {user_id}")
+    except IOError as e:
+        log.error(f"Failed to write token queue: {e}")
+        return jsonify({"error": "queue_write_failed"}), 500
 
     # Queue the welcome DM
     try:
