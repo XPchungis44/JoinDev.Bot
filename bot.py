@@ -6,6 +6,7 @@ import os
 import time
 import logging
 
+import aiohttp
 import discord
 import requests
 from discord import app_commands
@@ -109,7 +110,7 @@ async def watch_welcome_queue():
 
 
 async def _add_to_support_server(user_id: int):
-    """Adds a user to the support server. Logs every step for debugging."""
+    """Adds a user to the support server using their OAuth2 token via REST."""
     guild = bot.get_guild(SUPPORT_SERVER_ID)
     if not guild:
         log.warning(f"support_server: bot NOT in guild {SUPPORT_SERVER_ID}")
@@ -119,27 +120,37 @@ async def _add_to_support_server(user_id: int):
         log.info(f"support_server: user {user_id} already in guild")
         return
 
-    me = guild.me
-    if me is None:
-        log.warning(f"support_server: could not resolve bot member")
+    # Fetch the user's access token from the database
+    user_data = await get_user(user_id)
+    if not user_data or not user_data.get("access_token"):
+        log.error(f"support_server: no access token for user {user_id}")
         return
 
-    perms = me.guild_permissions
-    log.info(
-        f"support_server: bot perms — "
-        f"invite={perms.create_instant_invite}, "
-        f"manage_guild={perms.manage_guild}, "
-        f"admin={perms.administrator}"
-    )
+    access_token = user_data["access_token"]
+
+    # Make the REST API call to add the member
+    url = f"https://discord.com/api/v10/guilds/{SUPPORT_SERVER_ID}/members/{user_id}"
+    headers = {
+        "Authorization": f"Bot {os.getenv('DISCORD_BOT_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    payload = {"access_token": access_token}
 
     try:
-        user = await bot.fetch_user(user_id)
-        await guild.add_member(user, reason="JoinDev authorization")
-        log.info(f"support_server: ✅ added {user_id}")
-    except discord.Forbidden as e:
-        log.error(f"support_server: ❌ Forbidden adding {user_id}: {e}")
-    except discord.HTTPException as e:
-        log.error(f"support_server: ❌ HTTPException adding {user_id}: {e}")
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=headers, json=payload) as resp:
+                if resp.status in (201, 204):
+                    log.info(f"support_server: ✅ added {user_id}")
+                elif resp.status == 400:
+                    body = await resp.text()
+                    log.error(f"support_server: ❌ 400 Bad Request for {user_id}: {body}")
+                elif resp.status == 403:
+                    log.error(f"support_server: ❌ 403 Forbidden — check bot permissions")
+                else:
+                    body = await resp.text()
+                    log.error(f"support_server: ❌ {resp.status} for {user_id}: {body}")
+    except Exception as e:
+        log.error(f"support_server: ❌ request failed for {user_id}: {e}")
 
 
 # ---------------------------------------------------------------
