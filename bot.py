@@ -16,6 +16,7 @@ from welcome import build_welcome_embed
 from oauth_callback import WELCOME_QUEUE_FILE, TOKEN_QUEUE_FILE
 from database import (
     init_pool,
+    get_pool,
     upsert_user,
     get_user,
     claim_daily,
@@ -33,7 +34,6 @@ from database import (
     get_all_users,
     update_tokens,
     THREE_DAYS,
-    _pool,
 )
 
 log = logging.getLogger("joindev.bot")
@@ -41,7 +41,7 @@ log = logging.getLogger("joindev.bot")
 intents = discord.Intents.default()
 intents.members = True
 intents.dm_messages = True
-intents.message_content = True  # needed for prefix commands like .join
+intents.message_content = True
 
 bot = commands.Bot(command_prefix=".", intents=intents)
 
@@ -71,7 +71,6 @@ async def setup_hook():
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
-    # ---- Process token queue first ----
     if os.path.exists(TOKEN_QUEUE_FILE):
         try:
             with open(TOKEN_QUEUE_FILE, "r") as f:
@@ -98,7 +97,6 @@ async def watch_welcome_queue():
         except IOError as e:
             log.error(f"Token queue read error: {e}")
 
-    # ---- Process welcome DM queue ----
     if not os.path.exists(WELCOME_QUEUE_FILE):
         return
     try:
@@ -199,7 +197,6 @@ async def check_join_rewards():
 
 
 async def _leave_guild(guild_id: int):
-    """Makes the bot leave a guild — never leaves the support server."""
     if guild_id == SUPPORT_SERVER_ID:
         log.warning(f"Refusing to leave support server {guild_id}")
         return
@@ -272,7 +269,7 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------
-# SLASH COMMANDS — HELP
+# HELP
 # ---------------------------------------------------------------
 @bot.tree.command(name="help", description="Show all JoinDev commands.")
 async def help_cmd(interaction: discord.Interaction):
@@ -281,50 +278,32 @@ async def help_cmd(interaction: discord.Interaction):
         description="*Server growth made easy!*",
         color=0x5865F2,
     )
-
     embed.add_field(
         name="🪙 Earn JoinCoins",
-        value=(
-            "`/daily` — Claim 3+ JoinCoins every 24 hours\n"
-            "`/balance` — Check your JoinCoin balance"
-        ),
+        value="`/daily` — Claim 3+ JoinCoins every 24 hours\n`/balance` — Check your balance",
         inline=False,
     )
-
     embed.add_field(
         name="🚀 Farm Servers",
-        value=(
-            "`/auto_join <amount|max>` — Spend coins to join servers\n"
-            "`/cancel_joinr` — Stop all pending auto-joins\n"
-            "`/resume_joinr` — Re-enable auto-joins"
-        ),
+        value="`/auto_join <amount|max>` — Spend coins to join servers\n`/cancel_joinr` — Stop auto-joins\n`/resume_joinr` — Re-enable auto-joins",
         inline=False,
     )
-
     embed.add_field(
         name="👥 Grow Your Server",
-        value=(
-            "`/submit_server <invite>` — Add your server to the pool\n"
-            "`/buy_members <amount|max>` — Spend coins to get members"
-        ),
+        value="`/submit_server <invite>` — Add your server\n`/buy_members <amount|max>` — Get members",
         inline=False,
     )
-
     embed.add_field(
         name="🔗 Links",
-        value=(
-            "Website: https://xpchungis44.github.io/JoinDev/\n"
-            "Support: https://discord.gg/HJbbKYbr2y"
-        ),
+        value="Website: https://xpchungis44.github.io/JoinDev/\nSupport: https://discord.gg/HJbbKYbr2y",
         inline=False,
     )
-
     embed.set_footer(text="JoinDev • Beta • Server growth made easy!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------
-# SLASH COMMANDS — USER
+# USER SLASH COMMANDS
 # ---------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check if JoinDev is online.")
 async def ping(interaction: discord.Interaction):
@@ -338,9 +317,7 @@ async def balance(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
     if not user:
         await interaction.response.send_message(
-            "You haven't authorized JoinDev yet. Visit:\n"
-            "https://xpchungis44.github.io/JoinDev/",
-            ephemeral=True,
+            "Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True,
         )
         return
     await interaction.response.send_message(
@@ -356,8 +333,7 @@ async def daily(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
     if not user:
         await interaction.followup.send(
-            "Authorize first: https://xpchungis44.github.io/JoinDev/",
-            ephemeral=True,
+            "Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True,
         )
         return
     result = await claim_daily(interaction.user.id, int(time.time()))
@@ -372,27 +348,23 @@ async def daily(interaction: discord.Interaction):
             await interaction.followup.send("Something went wrong.", ephemeral=True)
         return
     embed = discord.Embed(title="🪙 Daily Reward Claimed!", color=0x5865F2)
-    embed.add_field(name="Coins Earned", value=f"**+{result['coins_awarded']}**", inline=True)
-    embed.add_field(name="Streak", value=f"🔥 **{result['new_streak']}** days", inline=True)
-    embed.add_field(name="New Balance", value=f"**{result['new_balance']}**", inline=True)
+    embed.add_field(name="Coins", value=f"**+{result['coins_awarded']}**", inline=True)
+    embed.add_field(name="Streak", value=f"🔥 **{result['new_streak']}**", inline=True)
+    embed.add_field(name="Balance", value=f"**{result['new_balance']}**", inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="cancel_joinr", description="Stop all pending auto-joins immediately.")
+@bot.tree.command(name="cancel_joinr", description="Stop all pending auto-joins.")
 async def cancel_joinr(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
     if not user:
         await interaction.response.send_message("Authorize first.", ephemeral=True)
         return
     if user["do_not_join"]:
-        await interaction.response.send_message(
-            "🚫 Already disabled. Use `/resume_joinr`.", ephemeral=True,
-        )
+        await interaction.response.send_message("🚫 Already disabled.", ephemeral=True)
         return
     await set_do_not_join(interaction.user.id, True)
-    await interaction.response.send_message(
-        "✅ **Auto-joins disabled.** Use `/resume_joinr` to re-enable.", ephemeral=True,
-    )
+    await interaction.response.send_message("✅ Auto-joins disabled.", ephemeral=True)
 
 
 @bot.tree.command(name="resume_joinr", description="Re-enable auto-joins.")
@@ -405,9 +377,7 @@ async def resume_joinr(interaction: discord.Interaction):
         await interaction.response.send_message("✅ Already active.", ephemeral=True)
         return
     await set_do_not_join(interaction.user.id, False)
-    await interaction.response.send_message(
-        "✅ **Auto-joins re-enabled.**", ephemeral=True,
-    )
+    await interaction.response.send_message("✅ Auto-joins re-enabled.", ephemeral=True)
 
 
 @bot.tree.command(name="submit_server", description="Add your server to the JoinDev pool.")
@@ -435,10 +405,7 @@ async def submit_server(interaction: discord.Interaction, invite: str):
     )
     embed.add_field(
         name="What happens next?",
-        value=(
-            "Once I'm in your server, run `/buy_members` to place an order.\n"
-            "Members stay for 3 full days, then I leave automatically."
-        ),
+        value="Run `/buy_members` to place an order. Members stay 3 days, then I leave automatically.",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -454,7 +421,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
         await interaction.followup.send("Authorize first.", ephemeral=True)
         return
     if user["do_not_join"]:
-        await interaction.followup.send("🚫 Auto-joins disabled. Run `/resume_joinr`.", ephemeral=True)
+        await interaction.followup.send("🚫 Auto-joins disabled.", ephemeral=True)
         return
 
     balance = user["joindev_coins"]
@@ -482,7 +449,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     to_join = min(to_join, len(servers))
     servers = servers[:to_join]
 
-    async with _pool.acquire() as conn:
+    async with get_pool().acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
             interaction.user.id, to_join,
@@ -497,9 +464,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
                 failed += 1
                 continue
             await guild.add_member(interaction.user, reason="JoinDev auto-join")
-            await create_active_join(
-                interaction.user.id, srv["guild_id"], None, int(time.time()),
-            )
+            await create_active_join(interaction.user.id, srv["guild_id"], None, int(time.time()))
             joined += 1
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"Failed to join {srv['guild_id']}: {e}")
@@ -518,7 +483,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
 @bot.tree.command(name="buy_members", description="Spend JoinCoins to bring members to your server.")
 @app_commands.describe(amount="How many members you want, or 'max'")
 async def buy_members(interaction: discord.Interaction, amount: str):
-    # Immediate response so Discord doesn't time out
     await interaction.response.send_message(
         "⏳ **Adding users to your server — this may take a while.**\n"
         "You can cancel at any time with `/cancel_joinr`.",
@@ -553,14 +517,14 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             await interaction.edit_original_response(content="Provide a number or 'max'.")
             return
         if to_order <= 0 or to_order > balance:
-            await interaction.edit_original_response(content=f"Invalid amount. You have {balance}.")
+            await interaction.edit_original_response(content=f"Invalid. You have {balance}.")
             return
 
     order_id = await create_order(
         interaction.guild.id, interaction.user.id, to_order, to_order, int(time.time()),
     )
 
-    async with _pool.acquire() as conn:
+    async with get_pool().acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
             interaction.user.id, to_order,
@@ -573,7 +537,6 @@ async def buy_members(interaction: discord.Interaction, amount: str):
 
     added = 0
     for c in candidates:
-        # Skip users already in the guild
         if interaction.guild.get_member(c["user_id"]):
             continue
         try:
@@ -593,13 +556,13 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             f"✅ **Order #{order_id} placed!**\n"
             f"Requested: **{to_order}** • Added: **{added}**\n"
             f"Coins spent: **{to_order}**\n\n"
-            f"Members must stay 3 days. Then I leave your server."
+            f"Members stay 3 days. Then I leave your server."
         )
     )
 
 
 # ---------------------------------------------------------------
-# ADMIN PREFIX COMMANDS (only ADMIN_USER_ID)
+# ADMIN PREFIX COMMANDS
 # ---------------------------------------------------------------
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
@@ -607,16 +570,14 @@ def is_admin(user_id: int) -> bool:
 
 @bot.command(name="join")
 async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
-    """Force-add users to a guild. Usage: .join <server_id> <amount|max>"""
     if not is_admin(ctx.author.id):
         return
-
     guild = bot.get_guild(guild_id)
     if not guild:
         await ctx.send(f"❌ Bot is not in server `{guild_id}`.")
         return
 
-    async with _pool.acquire() as conn:
+    async with get_pool().acquire() as conn:
         if amount.lower() == "max":
             rows = await conn.fetch("SELECT user_id FROM joindev.users WHERE do_not_join = FALSE")
         else:
@@ -643,71 +604,61 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"Failed {uid}: {e}")
 
-    await ctx.send(
-        f"✅ Added **{added}** users to **{guild.name}**.\n"
-        f"Skipped (already in): **{skipped}**"
-    )
+    await ctx.send(f"✅ Added **{added}** to **{guild.name}**. Skipped: **{skipped}**")
 
 
 @bot.command(name="give")
 async def admin_give(ctx: commands.Context, user_id: int, amount: int):
-    """Give JoinCoins to a user. Usage: .give <user_id> <amount>"""
     if not is_admin(ctx.author.id):
         return
-
     user = await get_user(user_id)
     if not user:
-        await ctx.send(f"❌ User `{user_id}` is not authorized.")
+        await ctx.send(f"❌ User `{user_id}` not authorized.")
         return
-
     new_balance = await add_coins(user_id, amount)
-    await ctx.send(
-        f"✅ Gave **{amount}** JoinCoins to <@{user_id}>.\n"
-        f"New balance: **{new_balance}**"
-    )
+    await ctx.send(f"✅ Gave **{amount}** to <@{user_id}>. New balance: **{new_balance}**")
 
 
 @bot.command(name="check")
 async def admin_check(ctx: commands.Context):
-    """Show JoinDev stats."""
     if not is_admin(ctx.author.id):
         return
 
-    async with _pool.acquire() as conn:
-        auth_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users")
-        active_orders = await conn.fetchval(
-            "SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'"
-        )
-        active_joins = await conn.fetchval(
-            "SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE"
-        )
-        total_coins = await conn.fetchval(
-            "SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users"
-        )
-        total_servers = await conn.fetchval(
-            "SELECT COUNT(*) FROM joindev.server_pool WHERE active = TRUE"
-        )
-        completed_orders = await conn.fetchval(
-            "SELECT COUNT(*) FROM joindev.orders WHERE status = 'completed'"
-        )
+    try:
+        async with get_pool().acquire() as conn:
+            auth_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users")
+            active_orders = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'"
+            )
+            active_joins = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE"
+            )
+            total_coins = await conn.fetchval(
+                "SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users"
+            )
+            total_servers = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.server_pool WHERE active = TRUE"
+            )
+            completed_orders = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.orders WHERE status = 'completed'"
+            )
+    except Exception as e:
+        await ctx.send(f"❌ **DB error:** `{type(e).__name__}: {e}`")
+        log.error(f".check failed: {e}")
+        return
 
-    embed = discord.Embed(
-        title="📊 JoinDev Stats",
-        color=0x5865F2,
-    )
+    embed = discord.Embed(title="📊 JoinDev Stats", color=0x5865F2)
     embed.add_field(name="👥 Authorized Users", value=f"**{auth_count}**", inline=True)
     embed.add_field(name="📦 Active Orders", value=f"**{active_orders}**", inline=True)
     embed.add_field(name="✅ Completed Orders", value=f"**{completed_orders}**", inline=True)
     embed.add_field(name="🔗 Pending Joins", value=f"**{active_joins}**", inline=True)
     embed.add_field(name="🌐 Active Servers", value=f"**{total_servers}**", inline=True)
     embed.add_field(name="🪙 Total JoinCoins Held", value=f"**{total_coins}**", inline=True)
-
     await ctx.send(embed=embed)
 
 
 @bot.command(name="leave")
 async def admin_leave(ctx: commands.Context, guild_id: int):
-    """Force bot to leave a guild. Usage: .leave <server_id>"""
     if not is_admin(ctx.author.id):
         return
     if guild_id == SUPPORT_SERVER_ID:
@@ -721,8 +672,5 @@ async def admin_leave(ctx: commands.Context, guild_id: int):
     await ctx.send(f"✅ Left **{guild.name}**.")
 
 
-# ---------------------------------------------------------------
-# RUN
-# ---------------------------------------------------------------
 if __name__ == "__main__":
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
