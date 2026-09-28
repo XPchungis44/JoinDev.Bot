@@ -58,6 +58,41 @@ ADMIN_USER_ID = 1459373221756538923
 
 
 # ---------------------------------------------------------------
+# SHARED HELPER — ADD A USER TO A GUILD VIA REST API
+# ---------------------------------------------------------------
+async def _add_user_to_guild(guild_id: int, user_id: int, reason: str = "JoinDev") -> bool:
+    """
+    Adds a user to a guild using their stored OAuth token.
+    Returns True on success (or already-a-member), False otherwise.
+    """
+    user_data = await get_user(user_id)
+    if not user_data or not user_data.get("access_token"):
+        log.error(f"add_user: no OAuth token for user {user_id}")
+        return False
+
+    url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}"
+    headers = {
+        "Authorization": f"Bot {os.getenv('DISCORD_BOT_TOKEN')}",
+        "Content-Type": "application/json",
+        "X-Audit-Log-Reason": reason[:512],
+    }
+    payload = {"access_token": user_data["access_token"]}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=headers, json=payload) as resp:
+                if resp.status in (201, 204):
+                    log.info(f"add_user: ✅ {user_id} → {guild_id}")
+                    return True
+                body = await resp.text()
+                log.error(f"add_user: ❌ {resp.status} for {user_id} → {guild_id}: {body}")
+                return False
+    except Exception as e:
+        log.error(f"add_user: ❌ request failed for {user_id} → {guild_id}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------
 # SETUP HOOK
 # ---------------------------------------------------------------
 @bot.event
@@ -68,7 +103,7 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# WELCOME DM QUEUE WATCHER (Postgres-backed)
+# WELCOME DM QUEUE WATCHER
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
@@ -101,7 +136,7 @@ async def watch_welcome_queue():
         except discord.HTTPException as e:
             log.error(f"watch_welcome_queue: ❌ DM failed for {user_id}: {e}")
 
-        # 3. Mark as done regardless
+        # 3. Mark as done
         try:
             await mark_welcome_sent(row["id"])
             log.info(f"watch_welcome_queue: marked row {row['id']} as sent")
@@ -120,37 +155,9 @@ async def _add_to_support_server(user_id: int):
         log.info(f"support_server: user {user_id} already in guild")
         return
 
-    # Fetch the user's access token from the database
-    user_data = await get_user(user_id)
-    if not user_data or not user_data.get("access_token"):
-        log.error(f"support_server: no access token for user {user_id}")
-        return
-
-    access_token = user_data["access_token"]
-
-    # Make the REST API call to add the member
-    url = f"https://discord.com/api/v10/guilds/{SUPPORT_SERVER_ID}/members/{user_id}"
-    headers = {
-        "Authorization": f"Bot {os.getenv('DISCORD_BOT_TOKEN')}",
-        "Content-Type": "application/json",
-    }
-    payload = {"access_token": access_token}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.put(url, headers=headers, json=payload) as resp:
-                if resp.status in (201, 204):
-                    log.info(f"support_server: ✅ added {user_id}")
-                elif resp.status == 400:
-                    body = await resp.text()
-                    log.error(f"support_server: ❌ 400 Bad Request for {user_id}: {body}")
-                elif resp.status == 403:
-                    log.error(f"support_server: ❌ 403 Forbidden — check bot permissions")
-                else:
-                    body = await resp.text()
-                    log.error(f"support_server: ❌ {resp.status} for {user_id}: {body}")
-    except Exception as e:
-        log.error(f"support_server: ❌ request failed for {user_id}: {e}")
+    ok = await _add_user_to_guild(SUPPORT_SERVER_ID, user_id, reason="JoinDev authorization")
+    if not ok:
+        log.error(f"support_server: failed to add {user_id}")
 
 
 # ---------------------------------------------------------------
@@ -485,16 +492,20 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     joined = 0
     failed = 0
     for srv in servers:
-        try:
-            guild = bot.get_guild(srv["guild_id"])
-            if not guild:
-                failed += 1
-                continue
-            await guild.add_member(interaction.user, reason="JoinDev auto-join")
-            await create_active_join(interaction.user.id, srv["guild_id"], None, int(time.time()))
+        guild = bot.get_guild(srv["guild_id"])
+        if not guild:
+            failed += 1
+            continue
+
+        ok = await _add_user_to_guild(
+            srv["guild_id"], interaction.user.id, reason="JoinDev auto-join"
+        )
+        if ok:
+            await create_active_join(
+                interaction.user.id, srv["guild_id"], None, int(time.time())
+            )
             joined += 1
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"auto_join: failed {srv['guild_id']}: {e}")
+        else:
             failed += 1
 
     if failed:
@@ -566,17 +577,15 @@ async def buy_members(interaction: discord.Interaction, amount: str):
     for c in candidates:
         if interaction.guild.get_member(c["user_id"]):
             continue
-        try:
-            await interaction.guild.add_member(
-                discord.Object(id=c["user_id"]),
-                reason=f"JoinDev order #{order_id}",
-            )
+
+        ok = await _add_user_to_guild(
+            interaction.guild.id, c["user_id"], reason=f"JoinDev order #{order_id}"
+        )
+        if ok:
             await create_active_join(
-                c["user_id"], interaction.guild.id, order_id, int(time.time()),
+                c["user_id"], interaction.guild.id, order_id, int(time.time())
             )
             added += 1
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"buy_members: failed adding {c['user_id']}: {e}")
 
     await interaction.edit_original_response(
         content=(
@@ -624,12 +633,11 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
         if guild.get_member(uid):
             skipped += 1
             continue
-        try:
-            await guild.add_member(discord.Object(id=uid), reason="Admin .join")
+
+        ok = await _add_user_to_guild(guild_id, uid, reason="Admin .join")
+        if ok:
             await create_active_join(uid, guild.id, None, int(time.time()))
             added += 1
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"admin_join: failed {uid}: {e}")
 
     await ctx.send(f"✅ Added **{added}** to **{guild.name}**. Skipped: **{skipped}**")
 
