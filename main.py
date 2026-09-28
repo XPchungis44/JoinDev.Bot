@@ -25,7 +25,13 @@ health_app = Flask(__name__)
 def health():
     return jsonify({"status": "ok"}), 200
 
-
+@health_app.route("/")
+def root():
+    return jsonify({
+        "status": "online",
+        "service": "JoinDev Bot",
+        "message": "Server growth made easy!"
+    }), 200
 health_app.register_blueprint(oauth_bp)
 
 
