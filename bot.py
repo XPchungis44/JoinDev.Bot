@@ -3,6 +3,7 @@ bot.py — JoinDev Discord bot (commands + background tasks)
 """
 
 import os
+import json
 import time
 import logging
 
@@ -12,9 +13,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from welcome import build_welcome_embed
-from oauth_callback import WELCOME_QUEUE_FILE
+from oauth_callback import WELCOME_QUEUE_FILE, TOKEN_QUEUE_FILE
 from database import (
     init_pool,
+    upsert_user,
     get_user,
     claim_daily,
     set_do_not_join,
@@ -61,10 +63,36 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# WELCOME QUEUE WATCHER
+# QUEUE WATCHER — handles both token storage and welcome DMs
 # ---------------------------------------------------------------
 @tasks.loop(seconds=5)
 async def watch_welcome_queue():
+    # ---- Process token queue first (DB writes on bot's loop) ----
+    if os.path.exists(TOKEN_QUEUE_FILE):
+        try:
+            with open(TOKEN_QUEUE_FILE, "r") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            if lines:
+                open(TOKEN_QUEUE_FILE, "w").close()
+
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    await upsert_user(
+                        user_id=entry["user_id"],
+                        access_token=entry["access_token"],
+                        refresh_token=entry["refresh_token"],
+                        expires_at=entry["expires_at"],
+                    )
+                    log.info(f"Stored tokens for user {entry['user_id']}")
+                except json.JSONDecodeError as e:
+                    log.error(f"Bad token JSON: {e}")
+                except Exception as e:
+                    log.error(f"Failed to store tokens: {e}")
+        except IOError as e:
+            log.error(f"Token queue read error: {e}")
+
+    # ---- Process welcome DM queue ----
     if not os.path.exists(WELCOME_QUEUE_FILE):
         return
     try:
