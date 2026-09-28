@@ -12,7 +12,7 @@ import requests
 
 from flask import Flask, jsonify
 
-from oauth_callback import oauth_app
+from oauth_callback import oauth_bp
 from database import init_pool, get_all_users, update_tokens
 
 log = logging.getLogger("joindev")
@@ -28,7 +28,8 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-health_app.register_blueprint(oauth_app)
+# Register the BLUEPRINT (not a Flask app)
+health_app.register_blueprint(oauth_bp)
 
 
 # ---------------------------------------------------------------
