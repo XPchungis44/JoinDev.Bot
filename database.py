@@ -43,7 +43,8 @@ async def init_pool():
                 first_seen       BIGINT,
                 trusted          BOOLEAN DEFAULT FALSE,
                 appealed         BOOLEAN DEFAULT FALSE,
-                appeal_note      TEXT
+                appeal_note      TEXT,
+                whitelisted      BOOLEAN DEFAULT FALSE
             )
         """)
 
@@ -57,6 +58,7 @@ async def init_pool():
             ("trusted", "BOOLEAN DEFAULT FALSE"),
             ("appealed", "BOOLEAN DEFAULT FALSE"),
             ("appeal_note", "TEXT"),
+            ("whitelisted", "BOOLEAN DEFAULT FALSE"),
         ]:
             try:
                 await conn.execute(
@@ -164,7 +166,6 @@ async def get_users_by_ip(ip: str):
 
 
 async def get_duplicate_ips():
-    """Returns IPs with 2+ distinct users."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT ip_address, COUNT(*) as count
@@ -172,6 +173,7 @@ async def get_duplicate_ips():
             WHERE ip_address IS NOT NULL
               AND banned = FALSE
               AND trusted = FALSE
+              AND whitelisted = FALSE
             GROUP BY ip_address
             HAVING COUNT(*) >= 2
         """)
@@ -190,6 +192,27 @@ async def strip_coins(user_id: int):
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = 0 WHERE user_id = $1", user_id,
         )
+
+
+async def set_whitelisted(user_id: int, whitelisted: bool):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET whitelisted = $2 WHERE user_id = $1",
+            user_id, whitelisted,
+        )
+
+
+async def get_recent_ips(limit: int = 20):
+    """Returns the most recently seen IPs with their user info."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id, ip_address, first_seen, banned, trusted, whitelisted
+            FROM joindev.users
+            WHERE ip_address IS NOT NULL
+            ORDER BY first_seen DESC NULLS LAST
+            LIMIT $1
+        """, limit)
+        return [dict(r) for r in rows]
 
 
 async def update_tokens(user_id, access_token, refresh_token, expires_at):
