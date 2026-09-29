@@ -59,17 +59,16 @@ INSTALL_URL = (
 SUPPORT_SERVER_ID = 1512995317430096063
 ADMIN_USER_ID = 1459373221756538923
 
-# Anti-abuse constants
-COOLDOWN_AUTO_JOIN = 10       # seconds
-COOLDOWN_BUY_MEMBERS = 30     # seconds
+COOLDOWN_AUTO_JOIN = 10
+COOLDOWN_BUY_MEMBERS = 30
 MAX_COINS = 10000
 MAX_ORDER_SIZE = 50
 
 
 # ---------------------------------------------------------------
-# SHARED HELPER — ADD USER TO GUILD VIA REST
+# SHARED HELPER
 # ---------------------------------------------------------------
-async def _add_user_to_guild(session: aiohttp.ClientSession, guild_id: int, user_id: int, reason: str = "JoinDev") -> bool:
+async def _add_user_to_guild(session, guild_id, user_id, reason="JoinDev"):
     user_data = await get_user(user_id)
     if not user_data or not user_data.get("access_token"):
         log.error(f"add_user: no token for {user_id}")
@@ -107,7 +106,7 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# WELCOME QUEUE WATCHER (every 3s for speed)
+# WELCOME QUEUE WATCHER
 # ---------------------------------------------------------------
 @tasks.loop(seconds=3)
 async def watch_welcome_queue():
@@ -125,13 +124,11 @@ async def watch_welcome_queue():
     for row in pending:
         user_id = row["user_id"]
 
-        # Add to support server
         async with aiohttp.ClientSession() as session:
             ok = await _add_user_to_guild(session, SUPPORT_SERVER_ID, user_id, "JoinDev authorization")
             if not ok:
                 log.error(f"support_server: failed to add {user_id}")
 
-        # Send DM
         try:
             user = await bot.fetch_user(user_id)
             await user.send(embed=build_welcome_embed())
@@ -467,7 +464,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
         await interaction.followup.send("🚫 Auto-joins disabled.", ephemeral=True)
         return
 
-    # Anti-abuse cooldown
     now = int(time.time())
     last = user.get("last_auto_join") or 0
     if now - last < COOLDOWN_AUTO_JOIN:
@@ -507,7 +503,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
         )
     await touch_auto_join(interaction.user.id, now)
 
-    # Concurrent adds for speed
     async with aiohttp.ClientSession() as session:
         tasks = [
             _add_user_to_guild(session, srv["guild_id"], interaction.user.id, "JoinDev auto-join")
@@ -518,7 +513,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     joined = sum(1 for r in results if r)
     failed = len(results) - joined
 
-    # Create active joins for successful adds
     for srv, ok in zip(servers, results):
         if ok:
             await create_active_join(interaction.user.id, srv["guild_id"], None, now)
@@ -559,7 +553,6 @@ async def buy_members(interaction: discord.Interaction, amount: str):
         await interaction.edit_original_response(content="🚫 You are banned.")
         return
 
-    # Anti-abuse cooldown
     now = int(time.time())
     last = user.get("last_buy_members") or 0
     if now - last < COOLDOWN_BUY_MEMBERS:
@@ -598,9 +591,10 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
             interaction.user.id, to_order,
         )
+        # FIX: do_not_join is INTEGER (0/1), banned is BOOLEAN
         candidates = await conn.fetch("""
             SELECT user_id FROM joindev.users
-            WHERE do_not_join = FALSE AND banned = FALSE AND user_id != $1
+            WHERE do_not_join = 0 AND banned = FALSE AND user_id != $1
             ORDER BY RANDOM()
             LIMIT $2
         """, interaction.user.id, to_order)
@@ -613,22 +607,27 @@ async def buy_members(interaction: discord.Interaction, amount: str):
         )
         return
 
-    # Concurrent adds for speed
+    targets = [c["user_id"] for c in candidates if not interaction.guild.get_member(c["user_id"])]
+
+    if not targets:
+        await interaction.edit_original_response(
+            content="❌ All eligible users are already in your server."
+        )
+        return
+
     async with aiohttp.ClientSession() as session:
         tasks = [
-            _add_user_to_guild(session, interaction.guild.id, c["user_id"], f"JoinDev order #{order_id}")
-            for c in candidates
-            if not interaction.guild.get_member(c["user_id"])
+            _add_user_to_guild(session, interaction.guild.id, uid, f"JoinDev order #{order_id}")
+            for uid in targets
         ]
         results = await asyncio.gather(*tasks)
 
     added = 0
-    for c, ok in zip([c for c in candidates if not interaction.guild.get_member(c["user_id"])], results):
+    for uid, ok in zip(targets, results):
         if ok:
-            await create_active_join(c["user_id"], interaction.guild.id, order_id, now)
+            await create_active_join(uid, interaction.guild.id, order_id, now)
             added += 1
 
-    # Refund coins for members we couldn't add
     refund = to_order - added
     if refund > 0:
         await add_coins(interaction.user.id, refund)
@@ -661,8 +660,9 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
 
     async with get_pool().acquire() as conn:
         if amount.lower() == "max":
+            # FIX: do_not_join = 0 instead of FALSE
             rows = await conn.fetch(
-                "SELECT user_id FROM joindev.users WHERE do_not_join = FALSE AND banned = FALSE"
+                "SELECT user_id FROM joindev.users WHERE do_not_join = 0 AND banned = FALSE"
             )
         else:
             try:
@@ -671,7 +671,7 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
                 await ctx.send("❌ Number or 'max'.")
                 return
             rows = await conn.fetch(
-                "SELECT user_id FROM joindev.users WHERE do_not_join = FALSE AND banned = FALSE LIMIT $1",
+                "SELECT user_id FROM joindev.users WHERE do_not_join = 0 AND banned = FALSE LIMIT $1",
                 n,
             )
 
