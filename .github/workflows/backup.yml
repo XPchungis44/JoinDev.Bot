@@ -2,15 +2,13 @@ name: Nightly Database Backup
 
 on:
   schedule:
-    # Runs at 3:00 AM UTC every day
-    - cron: '0 3 * * *'
-  workflow_dispatch: # Allows you to run it manually from the Actions tab
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,7 +25,6 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           FILENAME="joindev_$(date +'%Y-%m-%d_%H%M%S').sql.gz"
-          # Use the full path to pg_dump 18 to ensure correct version
           /usr/lib/postgresql/18/bin/pg_dump "$DATABASE_URL" | gzip > "$FILENAME"
           echo "BACKUP_FILENAME=$FILENAME" >> $GITHUB_ENV
 
