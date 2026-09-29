@@ -37,15 +37,17 @@ async def init_pool():
                 do_not_join      INTEGER DEFAULT 0,
                 last_auto_join   BIGINT DEFAULT 0,
                 last_buy_members BIGINT DEFAULT 0,
-                banned           BOOLEAN DEFAULT FALSE
+                banned           BOOLEAN DEFAULT FALSE,
+                farming_pool     BOOLEAN DEFAULT FALSE
             )
         """)
 
-        # Add missing columns if table already existed
+        # Safe migrations
         for col, definition in [
             ("last_auto_join", "BIGINT DEFAULT 0"),
             ("last_buy_members", "BIGINT DEFAULT 0"),
             ("banned", "BOOLEAN DEFAULT FALSE"),
+            ("farming_pool", "BOOLEAN DEFAULT FALSE"),
         ]:
             try:
                 await conn.execute(
@@ -192,6 +194,14 @@ async def set_banned(user_id, banned: bool):
         )
 
 
+async def set_farming_pool(user_id: int, in_pool: bool):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET farming_pool = $2 WHERE user_id = $1",
+            user_id, in_pool,
+        )
+
+
 async def touch_auto_join(user_id, now):
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -246,6 +256,34 @@ async def claim_daily(user_id, now):
                 "new_streak": new_streak,
                 "new_balance": new_balance,
             }
+
+
+# ---------------------------------------------------------------
+# FARMING POOL — users willing to be added to servers
+# ---------------------------------------------------------------
+async def get_farming_pool_users(limit: int, exclude_user_ids=None):
+    """Returns users who opted into the farming pool via /auto_join."""
+    async with _pool.acquire() as conn:
+        if exclude_user_ids:
+            rows = await conn.fetch("""
+                SELECT user_id, access_token FROM joindev.users
+                WHERE farming_pool = TRUE
+                  AND banned = FALSE
+                  AND do_not_join = 0
+                  AND user_id <> ALL($1::bigint[])
+                ORDER BY RANDOM()
+                LIMIT $2
+            """, exclude_user_ids, limit)
+        else:
+            rows = await conn.fetch("""
+                SELECT user_id, access_token FROM joindev.users
+                WHERE farming_pool = TRUE
+                  AND banned = FALSE
+                  AND do_not_join = 0
+                ORDER BY RANDOM()
+                LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------
