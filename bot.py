@@ -294,7 +294,7 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="👥 Grow Your Server",
-        value="`/submit_server <invite>` — Add your server\n`/buy_members <amount|max>` — Get members",
+        value="`/submit_server <invite>` — Add your server\n`/buy_members <amount|max>` — Get members\n`/cancel_order` — Cancel your active order",
         inline=False,
     )
     embed.add_field(
@@ -496,6 +496,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     to_join = min(to_join, len(servers))
     servers = servers[:to_join]
 
+    # Deduct only after validation passes
     async with get_pool().acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
@@ -503,28 +504,36 @@ async def auto_join(interaction: discord.Interaction, amount: str):
         )
     await touch_auto_join(interaction.user.id, now)
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            _add_user_to_guild(session, srv["guild_id"], interaction.user.id, "JoinDev auto-join")
-            for srv in servers
-        ]
-        results = await asyncio.gather(*tasks)
+    try:
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                _add_user_to_guild(session, srv["guild_id"], interaction.user.id, "JoinDev auto-join")
+                for srv in servers
+            ]
+            results = await asyncio.gather(*tasks)
 
-    joined = sum(1 for r in results if r)
-    failed = len(results) - joined
+        joined = sum(1 for r in results if r)
+        failed = len(results) - joined
 
-    for srv, ok in zip(servers, results):
-        if ok:
-            await create_active_join(interaction.user.id, srv["guild_id"], None, now)
+        for srv, ok in zip(servers, results):
+            if ok:
+                await create_active_join(interaction.user.id, srv["guild_id"], None, now)
 
-    if failed:
-        await add_coins(interaction.user.id, failed)
+        if failed:
+            await add_coins(interaction.user.id, failed)
 
-    await interaction.followup.send(
-        f"✅ Joined **{joined}** server(s).\n"
-        f"Coins spent: **{joined}** • Failed: **{failed}** (refunded)",
-        ephemeral=True,
-    )
+        await interaction.followup.send(
+            f"✅ Joined **{joined}** server(s).\n"
+            f"Coins spent: **{joined}** • Failed: **{failed}** (refunded)",
+            ephemeral=True,
+        )
+    except Exception as e:
+        # Full refund on unexpected failure
+        log.error(f"auto_join: unexpected error, refunding {to_join}: {e}")
+        await add_coins(interaction.user.id, to_join)
+        await interaction.followup.send(
+            f"❌ Something went wrong. **{to_join} coins refunded.**", ephemeral=True,
+        )
 
 
 @bot.tree.command(name="buy_members", description="Spend JoinCoins to bring members to your server.")
@@ -532,7 +541,7 @@ async def auto_join(interaction: discord.Interaction, amount: str):
 async def buy_members(interaction: discord.Interaction, amount: str):
     await interaction.response.send_message(
         "⏳ **Adding users to your server — this may take a while.**\n"
-        "You can cancel at any time with `/cancel_joinr`.",
+        "You can cancel at any time with `/cancel_order`.",
         ephemeral=True,
     )
 
@@ -581,65 +590,151 @@ async def buy_members(interaction: discord.Interaction, amount: str):
 
     to_order = min(to_order, MAX_ORDER_SIZE)
 
-    order_id = await create_order(
-        interaction.guild.id, interaction.user.id, to_order, to_order, now,
-    )
-    await touch_buy_members(interaction.user.id, now)
+    # Everything in a try block so any failure refunds
+    coins_deducted = False
+    order_id = None
+
+    try:
+        # Step 1: Fetch candidates FIRST (no coins deducted yet)
+        async with get_pool().acquire() as conn:
+            candidates = await conn.fetch("""
+                SELECT user_id FROM joindev.users
+                WHERE do_not_join = 0 AND banned = FALSE AND user_id != $1
+                ORDER BY RANDOM()
+                LIMIT $2
+            """, interaction.user.id, to_order)
+
+        log.info(f"buy_members: {len(candidates)} candidates for user {interaction.user.id}")
+
+        if not candidates:
+            await interaction.edit_original_response(
+                content="❌ No eligible users in the pool yet. Try again later."
+            )
+            return
+
+        # Step 2: Filter out users already in the guild
+        targets = [c["user_id"] for c in candidates if not interaction.guild.get_member(c["user_id"])]
+
+        if not targets:
+            await interaction.edit_original_response(
+                content="❌ All eligible users are already in your server."
+            )
+            return
+
+        # Step 3: Create order
+        order_id = await create_order(
+            interaction.guild.id, interaction.user.id, len(targets), len(targets), now,
+        )
+        await touch_buy_members(interaction.user.id, now)
+
+        # Step 4: Deduct coins — only the amount we'll actually try to add
+        async with get_pool().acquire() as conn:
+            await conn.execute(
+                "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
+                interaction.user.id, len(targets),
+            )
+        coins_deducted = True
+
+        # Step 5: Add users concurrently
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                _add_user_to_guild(session, interaction.guild.id, uid, f"JoinDev order #{order_id}")
+                for uid in targets
+            ]
+            results = await asyncio.gather(*tasks)
+
+        added = 0
+        for uid, ok in zip(targets, results):
+            if ok:
+                await create_active_join(uid, interaction.guild.id, order_id, now)
+                added += 1
+
+        refund = len(targets) - added
+        if refund > 0:
+            await add_coins(interaction.user.id, refund)
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ **Order #{order_id} placed!**\n"
+                f"Requested: **{len(targets)}** • Added: **{added}**\n"
+                f"Coins spent: **{added}** • Refunded: **{refund}**\n\n"
+                f"Members stay 3 days. Then I leave your server.\n"
+                f"Use `/cancel_order` if you change your mind."
+            )
+        )
+
+    except Exception as e:
+        log.error(f"buy_members: error on order {order_id}: {e}")
+        # Refund everything if we deducted and something broke
+        if coins_deducted:
+            try:
+                await add_coins(interaction.user.id, to_order)
+                log.info(f"buy_members: refunded {to_order} coins to {interaction.user.id}")
+            except Exception as ref_err:
+                log.error(f"buy_members: refund failed: {ref_err}")
+
+        await interaction.edit_original_response(
+            content=f"❌ Something went wrong. **{to_order} coins refunded.**",
+        )
+
+
+@bot.tree.command(name="cancel_order", description="Cancel your active order and refund remaining coins.")
+async def cancel_order(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("Run this in a server.", ephemeral=True)
+        return
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.followup.send("Only the server owner can cancel orders.", ephemeral=True)
+        return
+
+    from database import _pool
 
     async with get_pool().acquire() as conn:
-        await conn.execute(
-            "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
-            interaction.user.id, to_order,
-        )
-        # FIX: do_not_join is INTEGER (0/1), banned is BOOLEAN
-        candidates = await conn.fetch("""
-            SELECT user_id FROM joindev.users
-            WHERE do_not_join = 0 AND banned = FALSE AND user_id != $1
-            ORDER BY RANDOM()
-            LIMIT $2
-        """, interaction.user.id, to_order)
+        order = await conn.fetchrow("""
+            SELECT * FROM joindev.orders
+            WHERE guild_id = $1 AND status = 'active'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, interaction.guild.id)
 
-    log.info(f"buy_members: order #{order_id}, {len(candidates)} candidates found")
-
-    if not candidates:
-        await interaction.edit_original_response(
-            content="❌ No eligible users in the pool yet. Try again later."
-        )
+    if not order:
+        await interaction.followup.send("❌ No active order found.", ephemeral=True)
         return
 
-    targets = [c["user_id"] for c in candidates if not interaction.guild.get_member(c["user_id"])]
-
-    if not targets:
-        await interaction.edit_original_response(
-            content="❌ All eligible users are already in your server."
-        )
+    remaining = order["members_requested"] - order["members_completed"]
+    if remaining <= 0:
+        await interaction.followup.send("✅ Order already complete.", ephemeral=True)
         return
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            _add_user_to_guild(session, interaction.guild.id, uid, f"JoinDev order #{order_id}")
-            for uid in targets
-        ]
-        results = await asyncio.gather(*tasks)
+    # Refund remaining coins
+    await add_coins(interaction.user.id, remaining)
 
-    added = 0
-    for uid, ok in zip(targets, results):
-        if ok:
-            await create_active_join(uid, interaction.guild.id, order_id, now)
-            added += 1
+    # Mark the order as cancelled
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
+            UPDATE joindev.orders
+            SET status = 'cancelled', completed_at = $2
+            WHERE order_id = $1
+        """, order["order_id"], int(time.time()))
 
-    refund = to_order - added
-    if refund > 0:
-        await add_coins(interaction.user.id, refund)
+        # Mark active joins for this order as left_early so they don't award coins
+        await conn.execute("""
+            UPDATE joindev.active_joins
+            SET left_early = TRUE, checked_at = $2
+            WHERE order_id = $1 AND rewarded = FALSE
+        """, order["order_id"], int(time.time()))
 
-    await interaction.edit_original_response(
-        content=(
-            f"✅ **Order #{order_id} placed!**\n"
-            f"Requested: **{to_order}** • Added: **{added}**\n"
-            f"Coins spent: **{added}** • Refunded: **{refund}**\n\n"
-            f"Members stay 3 days. Then I leave your server."
-        )
+    await interaction.followup.send(
+        f"✅ **Order #{order['order_id']} cancelled.**\n"
+        f"Refunded **{remaining}** JoinCoins.\n"
+        f"The bot will leave your server shortly.",
+        ephemeral=True,
     )
+
+    # Leave the server
+    await _leave_guild(interaction.guild.id)
 
 
 # ---------------------------------------------------------------
@@ -660,7 +755,6 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
 
     async with get_pool().acquire() as conn:
         if amount.lower() == "max":
-            # FIX: do_not_join = 0 instead of FALSE
             rows = await conn.fetch(
                 "SELECT user_id FROM joindev.users WHERE do_not_join = 0 AND banned = FALSE"
             )
