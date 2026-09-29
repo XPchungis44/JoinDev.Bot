@@ -58,11 +58,17 @@ INSTALL_URL = (
 
 SUPPORT_SERVER_ID = 1512995317430096063
 ADMIN_USER_ID = 1459373221756538923
+TICKET_CHANNEL_URL = (
+    "https://canary.discord.com/channels/"
+    "1512995317430096063/1521312991507775599/1536401203997442140"
+)
 
 COOLDOWN_AUTO_JOIN = 10
 COOLDOWN_BUY_MEMBERS = 30
 MAX_COINS = 10000
 MAX_ORDER_SIZE = 50
+
+NO_ORDER_TIMEOUT = 24 * 60 * 60  # 24 hours
 
 
 # ---------------------------------------------------------------
@@ -106,7 +112,108 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# WELCOME QUEUE WATCHER
+# BOT JOINED A GUILD — SEND ONBOARDING DM + SCHEDULE 24H TIMEOUT
+# ---------------------------------------------------------------
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    log.info(f"on_guild_join: {guild.name} ({guild.id})")
+
+    # Skip the support server
+    if guild.id == SUPPORT_SERVER_ID:
+        return
+
+    # Try to DM the guild owner
+    try:
+        owner = await bot.fetch_user(guild.owner_id)
+        embed = discord.Embed(
+            title=f"👋 Thanks for adding me to {guild.name}!",
+            description="A few things you need to know before you get started.",
+            color=0x5865F2,
+        )
+        embed.add_field(
+            name="1️⃣ 24-Hour Grace Period",
+            value="I'll leave if no order is placed within **24 hours** — but you can always add me back!",
+            inline=False,
+        )
+        embed.add_field(
+            name="2️⃣ Refunds Are Automatic",
+            value="If a user leaves before completing their stay, your JoinCoin is **refunded**. When a replacement joins, that coin is deducted again.",
+            inline=False,
+        )
+        embed.add_field(
+            name="3️⃣ 3-Day Requirement",
+            value="A user must stay in your server for **3 full days** to consume one of your JoinCoins.",
+            inline=False,
+        )
+        embed.add_field(
+            name="4️⃣ Cancel Anytime",
+            value="You can cancel your order at any time with `/cancel_order`.",
+            inline=False,
+        )
+        embed.add_field(
+            name="📌 Additional Info",
+            value="When your order is complete and all members have stayed 3+ days, I'll leave your server automatically.",
+            inline=False,
+        )
+        embed.add_field(
+            name="🆘 Need Help?",
+            value=f"[Open a ticket here]({TICKET_CHANNEL_URL})",
+            inline=False,
+        )
+        embed.set_footer(text="JoinDev • Server growth made easy!")
+        await owner.send(embed=embed)
+        log.info(f"on_guild_join: welcome DM sent to {owner}")
+    except discord.Forbidden:
+        log.warning(f"on_guild_join: cannot DM owner of {guild.name}")
+    except Exception as e:
+        log.error(f"on_guild_join: DM failed: {e}")
+
+
+# ---------------------------------------------------------------
+# 24-HOUR AUTO-LEAVE TASK (no order placed)
+# ---------------------------------------------------------------
+@tasks.loop(minutes=10)
+async def leave_unused_guilds():
+    """Leaves guilds where the bot has been for 24h+ and no order was placed."""
+    now = int(time.time())
+
+    for guild in bot.guilds:
+        if guild.id == SUPPORT_SERVER_ID:
+            continue
+
+        # Check if there's any order (past or present) for this guild
+        try:
+            async with get_pool().acquire() as conn:
+                order_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM joindev.orders WHERE guild_id = $1",
+                    guild.id,
+                )
+        except Exception as e:
+            log.error(f"leave_unused: DB error for {guild.id}: {e}")
+            continue
+
+        if order_count > 0:
+            continue  # They've ordered before; the order lifecycle handles leaving
+
+        # Check how long we've been in the guild
+        # We don't track join time directly, so use the bot's `me.joined_at`
+        me = guild.me
+        if me is None or me.joined_at is None:
+            continue
+
+        joined_ts = int(me.joined_at.timestamp())
+        if now - joined_ts < NO_ORDER_TIMEOUT:
+            continue
+
+        log.info(f"leave_unused: leaving {guild.name} ({guild.id}) — no order in 24h")
+        try:
+            await guild.leave()
+        except discord.HTTPException as e:
+            log.error(f"leave_unused: failed to leave {guild.id}: {e}")
+
+
+# ---------------------------------------------------------------
+# WELCOME QUEUE WATCHER (users who authorized)
 # ---------------------------------------------------------------
 @tasks.loop(seconds=3)
 async def watch_welcome_queue():
@@ -142,7 +249,7 @@ async def watch_welcome_queue():
 
 
 # ---------------------------------------------------------------
-# 3-DAY REWARD CHECKER
+# 3-DAY REWARD CHECKER + REFUNDS ON EARLY LEAVE
 # ---------------------------------------------------------------
 @tasks.loop(hours=1)
 async def check_join_rewards():
@@ -161,13 +268,21 @@ async def check_join_rewards():
             guild = bot.get_guild(guild_id)
             if not guild:
                 await mark_join_left_early(join["id"])
+                # Refund if part of an order
+                if order_id:
+                    await _refund_order_slot(order_id, user_id)
                 continue
 
             member = guild.get_member(user_id)
             if member is None:
                 await mark_join_left_early(join["id"])
+                log.info(f"check_join_rewards: {user_id} left {guild_id} early")
+                # Refund the order owner
+                if order_id:
+                    await _refund_order_slot(order_id, user_id)
                 continue
 
+            # Still in guild after 3 days → reward
             await mark_join_rewarded(join["id"])
             new_balance = await add_coins(user_id, 1)
 
@@ -189,7 +304,8 @@ async def check_join_rewards():
                         owner = await bot.fetch_user(updated["owner_id"])
                         await owner.send(
                             f"✅ **Your order is complete!**\n"
-                            f"All **{updated['members_requested']}** members completed their stay."
+                            f"All **{updated['members_requested']}** members completed their stay.\n"
+                            f"I'm leaving your server now."
                         )
                     except (discord.Forbidden, discord.HTTPException):
                         pass
@@ -198,6 +314,29 @@ async def check_join_rewards():
 
         except Exception as e:
             log.error(f"check_join_rewards: error on {join['id']}: {e}")
+
+
+async def _refund_order_slot(order_id: int, user_id: int):
+    """Refunds one JoinCoin to the order owner and notifies them."""
+    try:
+        order = await get_order(order_id)
+        if not order or order["status"] != "active":
+            return
+
+        await add_coins(order["owner_id"], 1)
+        log.info(f"refund: 1 coin → owner {order['owner_id']} for order #{order_id}")
+
+        try:
+            owner = await bot.fetch_user(order["owner_id"])
+            await owner.send(
+                f"💰 **Refund** — A user (ID: `{user_id}`) left your server before completing "
+                f"their 3-day stay. **+1 JoinCoin** has been refunded.\n\n"
+                f"Run `/buy_members 1` to fill the slot with a new member."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    except Exception as e:
+        log.error(f"_refund_order_slot: failed for order {order_id}: {e}")
 
 
 async def _leave_guild(guild_id):
@@ -270,6 +409,8 @@ async def on_ready():
         check_join_rewards.start()
     if not refresh_tokens.is_running():
         refresh_tokens.start()
+    if not leave_unused_guilds.is_running():
+        leave_unused_guilds.start()
 
 
 # ---------------------------------------------------------------
@@ -299,7 +440,7 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🔗 Links",
-        value="Website: https://xpchungis44.github.io/JoinDev/\nSupport: https://discord.gg/HJbbKYbr2y",
+        value=f"Website: https://xpchungis44.github.io/JoinDev/\nSupport: https://discord.gg/HJbbKYbr2y\nTickets: [Open here]({TICKET_CHANNEL_URL})",
         inline=False,
     )
     embed.set_footer(text="JoinDev • Beta • Server growth made easy!")
@@ -496,7 +637,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     to_join = min(to_join, len(servers))
     servers = servers[:to_join]
 
-    # Deduct only after validation passes
     async with get_pool().acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
@@ -528,7 +668,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
             ephemeral=True,
         )
     except Exception as e:
-        # Full refund on unexpected failure
         log.error(f"auto_join: unexpected error, refunding {to_join}: {e}")
         await add_coins(interaction.user.id, to_join)
         await interaction.followup.send(
@@ -590,12 +729,10 @@ async def buy_members(interaction: discord.Interaction, amount: str):
 
     to_order = min(to_order, MAX_ORDER_SIZE)
 
-    # Everything in a try block so any failure refunds
     coins_deducted = False
     order_id = None
 
     try:
-        # Step 1: Fetch candidates FIRST (no coins deducted yet)
         async with get_pool().acquire() as conn:
             candidates = await conn.fetch("""
                 SELECT user_id FROM joindev.users
@@ -612,7 +749,6 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             )
             return
 
-        # Step 2: Filter out users already in the guild
         targets = [c["user_id"] for c in candidates if not interaction.guild.get_member(c["user_id"])]
 
         if not targets:
@@ -621,13 +757,11 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             )
             return
 
-        # Step 3: Create order
         order_id = await create_order(
             interaction.guild.id, interaction.user.id, len(targets), len(targets), now,
         )
         await touch_buy_members(interaction.user.id, now)
 
-        # Step 4: Deduct coins — only the amount we'll actually try to add
         async with get_pool().acquire() as conn:
             await conn.execute(
                 "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
@@ -635,7 +769,6 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             )
         coins_deducted = True
 
-        # Step 5: Add users concurrently
         async with aiohttp.ClientSession() as session:
             tasks = [
                 _add_user_to_guild(session, interaction.guild.id, uid, f"JoinDev order #{order_id}")
@@ -659,13 +792,13 @@ async def buy_members(interaction: discord.Interaction, amount: str):
                 f"Requested: **{len(targets)}** • Added: **{added}**\n"
                 f"Coins spent: **{added}** • Refunded: **{refund}**\n\n"
                 f"Members stay 3 days. Then I leave your server.\n"
-                f"Use `/cancel_order` if you change your mind."
+                f"If any leave early, you'll get refunded automatically.\n"
+                f"Use `/cancel_order` to cancel."
             )
         )
 
     except Exception as e:
         log.error(f"buy_members: error on order {order_id}: {e}")
-        # Refund everything if we deducted and something broke
         if coins_deducted:
             try:
                 await add_coins(interaction.user.id, to_order)
@@ -689,8 +822,6 @@ async def cancel_order(interaction: discord.Interaction):
         await interaction.followup.send("Only the server owner can cancel orders.", ephemeral=True)
         return
 
-    from database import _pool
-
     async with get_pool().acquire() as conn:
         order = await conn.fetchrow("""
             SELECT * FROM joindev.orders
@@ -708,10 +839,8 @@ async def cancel_order(interaction: discord.Interaction):
         await interaction.followup.send("✅ Order already complete.", ephemeral=True)
         return
 
-    # Refund remaining coins
     await add_coins(interaction.user.id, remaining)
 
-    # Mark the order as cancelled
     async with get_pool().acquire() as conn:
         await conn.execute("""
             UPDATE joindev.orders
@@ -719,7 +848,6 @@ async def cancel_order(interaction: discord.Interaction):
             WHERE order_id = $1
         """, order["order_id"], int(time.time()))
 
-        # Mark active joins for this order as left_early so they don't award coins
         await conn.execute("""
             UPDATE joindev.active_joins
             SET left_early = TRUE, checked_at = $2
@@ -729,11 +857,10 @@ async def cancel_order(interaction: discord.Interaction):
     await interaction.followup.send(
         f"✅ **Order #{order['order_id']} cancelled.**\n"
         f"Refunded **{remaining}** JoinCoins.\n"
-        f"The bot will leave your server shortly.",
+        f"I'll leave your server shortly.",
         ephemeral=True,
     )
 
-    # Leave the server
     await _leave_guild(interaction.guild.id)
 
 
