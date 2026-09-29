@@ -21,8 +21,10 @@ from database import (
     claim_daily,
     set_do_not_join,
     set_banned,
+    set_farming_pool,
     add_server,
     get_active_servers,
+    get_farming_pool_users,
     create_order,
     increment_order_completed,
     complete_order,
@@ -111,7 +113,7 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# ON GUILD JOIN — SEND ONBOARDING DM
+# ON GUILD JOIN — WELCOME DM
 # ---------------------------------------------------------------
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -419,7 +421,12 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🚀 Farm Servers",
-        value="`/auto_join <amount|max>` — Spend coins to join servers\n`/cancel_joinr` — Stop auto-joins\n`/resume_joinr` — Re-enable auto-joins",
+        value=(
+            "`/auto_join` — Join the farming pool\n"
+            "`/auto_join max` — Also join available servers now\n"
+            "`/cancel_joinr` — Leave the farming pool\n"
+            "`/resume_joinr` — Rejoin the farming pool"
+        ),
         inline=False,
     )
     embed.add_field(
@@ -482,6 +489,7 @@ async def status_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="📊 Your JoinDev Status", color=0x5865F2)
     embed.add_field(name="🪙 Coins", value=f"**{user['joindev_coins']}**", inline=True)
     embed.add_field(name="🔥 Streak", value=f"**{user['daily_streak']}**", inline=True)
+    embed.add_field(name="🎯 In Pool", value="✅" if user.get("farming_pool") else "❌", inline=True)
     embed.add_field(name="🔗 Active Joins", value=f"**{len(joins)}**", inline=True)
 
     if joins:
@@ -526,7 +534,7 @@ async def daily(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="cancel_joinr", description="Stop all pending auto-joins.")
+@bot.tree.command(name="cancel_joinr", description="Leave the farming pool. Stop receiving server joins.")
 async def cancel_joinr(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
     if not user:
@@ -536,20 +544,28 @@ async def cancel_joinr(interaction: discord.Interaction):
         await interaction.response.send_message("🚫 Already disabled.", ephemeral=True)
         return
     await set_do_not_join(interaction.user.id, True)
-    await interaction.response.send_message("✅ Auto-joins disabled.", ephemeral=True)
+    await set_farming_pool(interaction.user.id, False)
+    await interaction.response.send_message(
+        "✅ **Removed from the farming pool.**\nYou won't be added to any servers.",
+        ephemeral=True,
+    )
 
 
-@bot.tree.command(name="resume_joinr", description="Re-enable auto-joins.")
+@bot.tree.command(name="resume_joinr", description="Rejoin the farming pool.")
 async def resume_joinr(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
     if not user:
         await interaction.response.send_message("Authorize first.", ephemeral=True)
         return
     if not user["do_not_join"]:
-        await interaction.response.send_message("✅ Already active.", ephemeral=True)
+        await interaction.response.send_message("✅ Already in the pool.", ephemeral=True)
         return
     await set_do_not_join(interaction.user.id, False)
-    await interaction.response.send_message("✅ Auto-joins re-enabled.", ephemeral=True)
+    await set_farming_pool(interaction.user.id, True)
+    await interaction.response.send_message(
+        "✅ **Rejoined the farming pool.** You can now be added to servers.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="submit_server", description="Add your server to the JoinDev pool.")
@@ -583,52 +599,75 @@ async def submit_server(interaction: discord.Interaction, invite: str):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="auto_join", description="Spend JoinCoins to farm servers.")
-@app_commands.describe(amount="How many JoinCoins to spend, or 'max'")
-async def auto_join(interaction: discord.Interaction, amount: str):
+@bot.tree.command(name="auto_join", description="Join the farming pool. Get paid to join servers.")
+@app_commands.describe(amount="Optional: how many coins to spend right now, or 'max'")
+async def auto_join(interaction: discord.Interaction, amount: str = "0"):
     await interaction.response.defer(ephemeral=True)
 
     user = await get_user(interaction.user.id)
     if not user:
-        await interaction.followup.send("Authorize first.", ephemeral=True)
+        await interaction.followup.send(
+            "Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True,
+        )
         return
     if user["banned"]:
         await interaction.followup.send("🚫 You are banned.", ephemeral=True)
         return
-    if user["do_not_join"]:
-        await interaction.followup.send("🚫 Auto-joins disabled.", ephemeral=True)
-        return
+
+    # Always mark them as in the farming pool
+    await set_farming_pool(interaction.user.id, True)
 
     now = int(time.time())
     last = user.get("last_auto_join") or 0
     if now - last < COOLDOWN_AUTO_JOIN:
         wait = COOLDOWN_AUTO_JOIN - (now - last)
-        await interaction.followup.send(f"⏳ Wait **{wait}s** before using this again.", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ You're in the farming pool!\n"
+            f"⏳ Wait **{wait}s** before triggering an immediate join.",
+            ephemeral=True,
+        )
+        return
+
+    await touch_auto_join(interaction.user.id, now)
+
+    # Parse amount
+    try:
+        if amount.lower() == "max":
+            spend = user["joindev_coins"]
+        elif amount in ("0", ""):
+            spend = 0
+        else:
+            spend = int(amount)
+    except (ValueError, AttributeError):
+        spend = 0
+
+    if spend <= 0:
+        await interaction.followup.send(
+            "✅ **You're in the farming pool!**\n\n"
+            "You'll be added to servers as they become available. "
+            "When you stay 3 days in a server, you earn 1 JoinCoin.\n\n"
+            "Use `/auto_join max` to also join available servers right now.",
+            ephemeral=True,
+        )
         return
 
     balance = user["joindev_coins"]
-    if balance <= 0:
-        await interaction.followup.send("🪙 No coins. Run `/daily`.", ephemeral=True)
+    if spend > balance:
+        spend = balance
+    if spend <= 0:
+        await interaction.followup.send("🪙 No coins to spend. Run `/daily`.", ephemeral=True)
         return
-
-    if amount.lower() == "max":
-        to_join = balance
-    else:
-        try:
-            to_join = int(amount)
-        except ValueError:
-            await interaction.followup.send("Provide a number or 'max'.", ephemeral=True)
-            return
-        if to_join <= 0 or to_join > balance:
-            await interaction.followup.send("Invalid amount.", ephemeral=True)
-            return
 
     servers = await get_active_servers()
     if not servers:
-        await interaction.followup.send("📭 No servers in the pool.", ephemeral=True)
+        await interaction.followup.send(
+            "✅ **You're in the farming pool!**\n\n"
+            "📭 No servers available right now — you'll be added automatically when one opens up.",
+            ephemeral=True,
+        )
         return
 
-    to_join = min(to_join, len(servers))
+    to_join = min(spend, len(servers))
     servers = servers[:to_join]
 
     async with get_pool().acquire() as conn:
@@ -636,7 +675,6 @@ async def auto_join(interaction: discord.Interaction, amount: str):
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
             interaction.user.id, to_join,
         )
-    await touch_auto_join(interaction.user.id, now)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -657,15 +695,16 @@ async def auto_join(interaction: discord.Interaction, amount: str):
             await add_coins(interaction.user.id, failed)
 
         await interaction.followup.send(
-            f"✅ Joined **{joined}** server(s).\n"
+            f"✅ **You're in the farming pool!**\n\n"
+            f"Joined **{joined}** server(s) now.\n"
             f"Coins spent: **{joined}** • Failed: **{failed}** (refunded)",
             ephemeral=True,
         )
     except Exception as e:
-        log.error(f"auto_join: unexpected error, refunding {to_join}: {e}")
+        log.error(f"auto_join: error, refunding {to_join}: {e}")
         await add_coins(interaction.user.id, to_join)
         await interaction.followup.send(
-            f"❌ Something went wrong. **{to_join} coins refunded.**", ephemeral=True,
+            f"❌ Error joining servers. **{to_join} coins refunded.**", ephemeral=True,
         )
 
 
@@ -727,29 +766,32 @@ async def buy_members(interaction: discord.Interaction, amount: str):
     order_id = None
 
     try:
-        async with get_pool().acquire() as conn:
-            candidates = await conn.fetch("""
-                SELECT user_id FROM joindev.users
-                WHERE do_not_join = 0 AND banned = FALSE AND user_id != $1
-                ORDER BY RANDOM()
-                LIMIT $2
-            """, interaction.user.id, to_order)
+        # Only pick users who are in the farming pool
+        candidates = await get_farming_pool_users(
+            limit=to_order * 2,
+            exclude_user_ids=[interaction.user.id],
+        )
 
-        log.info(f"buy_members: {len(candidates)} candidates for user {interaction.user.id}")
+        log.info(f"buy_members: {len(candidates)} candidates in farming pool")
 
         if not candidates:
             await interaction.edit_original_response(
-                content="❌ No eligible users in the pool yet. Try again later."
+                content="❌ No eligible users in the farming pool yet. Try again later."
             )
             return
 
-        targets = [c["user_id"] for c in candidates if not interaction.guild.get_member(c["user_id"])]
+        targets = [
+            c["user_id"] for c in candidates
+            if not interaction.guild.get_member(c["user_id"])
+        ]
 
         if not targets:
             await interaction.edit_original_response(
                 content="❌ All eligible users are already in your server."
             )
             return
+
+        targets = targets[:to_order]
 
         order_id = await create_order(
             interaction.guild.id, interaction.user.id, len(targets), len(targets), now,
@@ -836,7 +878,6 @@ async def cancel_order(interaction: discord.Interaction):
         await interaction.followup.send("✅ Order already complete.", ephemeral=True)
         return
 
-    # Refund remaining unfilled slots only
     await add_coins(interaction.user.id, remaining)
 
     async with get_pool().acquire() as conn:
@@ -858,7 +899,7 @@ async def cancel_order(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------
-# FULL_CANCEL_ORDER — refunds everything, kicks members, rewards them
+# FULL_CANCEL_ORDER
 # ---------------------------------------------------------------
 @bot.tree.command(name="full_cancel_order", description="Fully undo the order: kick members, refund everything, reward them anyway.")
 async def full_cancel_order(interaction: discord.Interaction):
@@ -886,11 +927,9 @@ async def full_cancel_order(interaction: discord.Interaction):
     order_id = order["order_id"]
     remaining = order["members_requested"] - order["members_completed"]
 
-    # Refund remaining unfilled slots
     if remaining > 0:
         await add_coins(interaction.user.id, remaining)
 
-    # Fetch all unrewarded joins for this order
     async with get_pool().acquire() as conn:
         joins = await conn.fetch("""
             SELECT * FROM joindev.active_joins
@@ -903,7 +942,6 @@ async def full_cancel_order(interaction: discord.Interaction):
     for join in joins:
         user_id = join["user_id"]
 
-        # DM + reward + kick
         try:
             user = await bot.fetch_user(user_id)
             try:
@@ -918,11 +956,9 @@ async def full_cancel_order(interaction: discord.Interaction):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-            # Give them the coin
             await add_coins(user_id, 1)
             rewarded += 1
 
-            # Kick them
             member = interaction.guild.get_member(user_id)
             if member:
                 try:
@@ -934,7 +970,6 @@ async def full_cancel_order(interaction: discord.Interaction):
         except Exception as e:
             log.error(f"full_cancel: error on user {user_id}: {e}")
 
-    # Mark all these joins as rewarded AND left_early so the 3-day checker skips them
     async with get_pool().acquire() as conn:
         await conn.execute("""
             UPDATE joindev.active_joins
@@ -942,7 +977,6 @@ async def full_cancel_order(interaction: discord.Interaction):
             WHERE order_id = $1 AND rewarded = FALSE
         """, order_id, int(time.time()))
 
-        # Cancel the order
         await conn.execute("""
             UPDATE joindev.orders
             SET status = 'cancelled', completed_at = $2
@@ -977,26 +1011,20 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
         await ctx.send(f"❌ Not in `{guild_id}`.")
         return
 
-    async with get_pool().acquire() as conn:
-        if amount.lower() == "max":
-            rows = await conn.fetch(
-                "SELECT user_id FROM joindev.users WHERE do_not_join = 0 AND banned = FALSE"
-            )
-        else:
-            try:
-                n = int(amount)
-            except ValueError:
-                await ctx.send("❌ Number or 'max'.")
-                return
-            rows = await conn.fetch(
-                "SELECT user_id FROM joindev.users WHERE do_not_join = 0 AND banned = FALSE LIMIT $1",
-                n,
-            )
-
-    targets = [r["user_id"] for r in rows if not guild.get_member(r["user_id"])]
-    if not targets:
-        await ctx.send("No eligible users.")
+    try:
+        n = 1000 if amount.lower() == "max" else int(amount)
+    except ValueError:
+        await ctx.send("❌ Number or 'max'.")
         return
+
+    candidates = await get_farming_pool_users(limit=n * 2)
+    targets = [c["user_id"] for c in candidates if not guild.get_member(c["user_id"])]
+
+    if not targets:
+        await ctx.send("No eligible users in the farming pool.")
+        return
+
+    targets = targets[:n]
 
     async with aiohttp.ClientSession() as session:
         tasks = [_add_user_to_guild(session, guild_id, uid, "Admin .join") for uid in targets]
@@ -1047,6 +1075,7 @@ async def admin_check(ctx: commands.Context):
     try:
         async with get_pool().acquire() as conn:
             auth_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users")
+            pool_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE farming_pool = TRUE")
             active_orders = await conn.fetchval("SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'")
             active_joins = await conn.fetchval(
                 "SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE"
@@ -1062,6 +1091,7 @@ async def admin_check(ctx: commands.Context):
 
     embed = discord.Embed(title="📊 JoinDev Stats", color=0x5865F2)
     embed.add_field(name="👥 Users", value=f"**{auth_count}**", inline=True)
+    embed.add_field(name="🎯 In Pool", value=f"**{pool_count}**", inline=True)
     embed.add_field(name="🚫 Banned", value=f"**{banned}**", inline=True)
     embed.add_field(name="📦 Active Orders", value=f"**{active_orders}**", inline=True)
     embed.add_field(name="✅ Completed", value=f"**{completed_orders}**", inline=True)
