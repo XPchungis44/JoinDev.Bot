@@ -30,6 +30,10 @@ from database import (
     get_duplicate_ips,
     get_users_by_ip,
     get_recent_ips,
+    get_active_orders_with_remaining,
+    get_users_in_order,
+    get_all_users_in_guild_from_orders,
+    deduct_coins,
     mark_trusted,
     strip_coins,
     create_order,
@@ -84,9 +88,13 @@ MAX_ORDER_SIZE = 50
 NO_ORDER_TIMEOUT = 24 * 60 * 60
 TRUST_PERIOD = 14 * 24 * 60 * 60
 
+# Auto-backfill config
+BACKFILL_INTERVAL_MINUTES = 5
+BACKFILL_MAX_PER_CYCLE = 10
+
 
 # ---------------------------------------------------------------
-# BLACKLIST EMBED + DM
+# BLACKLIST EMBED
 # ---------------------------------------------------------------
 def build_blacklist_embed(user_id: int) -> discord.Embed:
     embed = discord.Embed(
@@ -117,7 +125,6 @@ async def _dm_blacklist(user_id: int):
     try:
         user = await bot.fetch_user(user_id)
         await user.send(embed=build_blacklist_embed(user_id))
-        log.info(f"blacklist: DM sent to {user_id}")
     except (discord.Forbidden, discord.HTTPException) as e:
         log.warning(f"blacklist: could not DM {user_id}: {e}")
 
@@ -176,7 +183,7 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# ALT DETECTION TASK
+# ALT DETECTION
 # ---------------------------------------------------------------
 @tasks.loop(hours=1)
 async def detect_alts():
@@ -219,7 +226,6 @@ async def detect_alts():
                 await set_banned(uid, True)
                 await strip_coins(uid)
                 await set_farming_pool(uid, False)
-                log.info(f"detect_alts: banned + stripped {uid}")
                 await _dm_blacklist(uid)
             except Exception as e:
                 log.error(f"detect_alts: ban failed for {uid}: {e}")
@@ -237,6 +243,132 @@ async def detect_alts():
             """, now - TRUST_PERIOD)
     except Exception as e:
         log.error(f"detect_alts: trusted update failed: {e}")
+
+
+# ---------------------------------------------------------------
+# AUTO-BACKFILL TASK
+# ---------------------------------------------------------------
+@tasks.loop(minutes=BACKFILL_INTERVAL_MINUTES)
+async def auto_backfill_orders():
+    """
+    Fills unfilled order slots with farming pool users.
+
+    Rules:
+    - Only active orders with unfilled slots
+    - Only farming pool users not already in the guild
+    - Deduct 1 coin per user added (Option A — pay on join)
+    - Skip orders where owner has 0 coins (Option A — skip if low balance)
+    - Max BACKFILL_MAX_PER_CYCLE users added per cycle
+    """
+    log.info("auto_backfill: scanning...")
+
+    try:
+        orders = await get_active_orders_with_remaining()
+    except Exception as e:
+        log.error(f"auto_backfill: query failed: {e}")
+        return
+
+    if not orders:
+        log.info("auto_backfill: no unfilled orders")
+        return
+
+    total_added = 0
+
+    for order in orders:
+        if total_added >= BACKFILL_MAX_PER_CYCLE:
+            break
+
+        order_id = order["order_id"]
+        guild_id = order["guild_id"]
+        owner_id = order["owner_id"]
+        remaining = order["members_requested"] - order["members_completed"]
+
+        if remaining <= 0:
+            continue
+
+        # Check if bot is still in the guild
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            log.warning(f"auto_backfill: bot not in guild {guild_id}, skipping order #{order_id}")
+            continue
+
+        # Check owner balance
+        owner = await get_user(owner_id)
+        if not owner:
+            continue
+        if owner["joindev_coins"] <= 0:
+            log.info(f"auto_backfill: owner {owner_id} has 0 coins, skipping order #{order_id}")
+            continue
+
+        # How many can we add this cycle?
+        allowance = min(
+            remaining,
+            owner["joindev_coins"],
+            BACKFILL_MAX_PER_CYCLE - total_added,
+        )
+
+        if allowance <= 0:
+            continue
+
+        # Get users already in this guild via any order
+        try:
+            already_in_guild = await get_all_users_in_guild_from_orders(guild_id)
+        except Exception as e:
+            log.error(f"auto_backfill: get users in guild failed: {e}")
+            continue
+
+        # Get farming pool candidates, excluding those already in the guild
+        try:
+            candidates = await get_farming_pool_users(
+                limit=allowance * 3,
+                exclude_user_ids=already_in_guild,
+            )
+        except Exception as e:
+            log.error(f"auto_backfill: get pool users failed: {e}")
+            continue
+
+        if not candidates:
+            log.info(f"auto_backfill: no candidates for order #{order_id}")
+            continue
+
+        # Add them via REST (batched)
+        to_add = candidates[:allowance]
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                _add_user_to_guild(session, guild_id, c["user_id"], f"Auto-backfill order #{order_id}")
+                for c in to_add
+            ]
+            results = await asyncio.gather(*tasks)
+
+        added_this_order = 0
+        for c, ok in zip(to_add, results):
+            if ok:
+                # Deduct 1 coin from owner
+                await deduct_coins(owner_id, 1)
+                # Create active join tied to this order
+                await create_active_join(c["user_id"], guild_id, order_id, int(time.time()))
+                added_this_order += 1
+                total_added += 1
+
+                # Notify the user
+                try:
+                    user = await bot.fetch_user(c["user_id"])
+                    await user.send(
+                        f"📥 **You've been added to a server!**\n\n"
+                        f"You were auto-added to **{guild.name}** as part of a JoinDev order.\n"
+                        f"Stay for **3 full days** to earn your JoinCoin!"
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        if added_this_order > 0:
+            log.info(f"auto_backfill: added {added_this_order} to order #{order_id}")
+
+        if total_added >= BACKFILL_MAX_PER_CYCLE:
+            break
+
+    log.info(f"auto_backfill: added {total_added} users this cycle")
 
 
 # ---------------------------------------------------------------
@@ -502,6 +634,9 @@ async def on_ready():
         leave_unused_guilds.start()
     if not detect_alts.is_running():
         detect_alts.start()
+    if not auto_backfill_orders.is_running():
+        auto_backfill_orders.start()
+        log.info(f"on_ready: started auto_backfill (every {BACKFILL_INTERVAL_MINUTES}m)")
 
 
 # ---------------------------------------------------------------
@@ -845,7 +980,8 @@ async def buy_members(interaction: discord.Interaction, amount: str):
         await interaction.edit_original_response(
             content=(
                 f"✅ **Order #{order_id} placed!**\n"
-                f"Added: **{added}** • Refunded: **{refund}**"
+                f"Added: **{added}** • Refunded: **{refund}**\n"
+                f"New users entering the pool will be auto-added."
             )
         )
     except Exception as e:
@@ -961,11 +1097,10 @@ async def full_cancel_order(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------
-# APPEAL COMMAND (prefix, available to banned users)
+# APPEAL COMMAND
 # ---------------------------------------------------------------
 @bot.command(name="appeal")
 async def appeal(ctx: commands.Context, note: str, user_id: int):
-    """Available even to banned users. Usage: .appeal <note> <your_user_id>"""
     if ctx.author.id != user_id:
         try:
             await ctx.send("❌ The user ID must match your own.", delete_after=10)
@@ -1057,48 +1192,36 @@ async def admin_ban(ctx: commands.Context, user_id: int):
 
 @bot.command(name="wl")
 async def admin_whitelist(ctx: commands.Context, user_id: int):
-    """Whitelists a user — they will never be flagged as an alt."""
     if not is_admin(ctx.author.id):
         return
-
     user = await get_user(user_id)
     if not user:
         await ctx.send(f"❌ `{user_id}` is not registered with JoinDev.")
         return
-
     if user.get("whitelisted"):
         await ctx.send(f"✅ `{user_id}` is already whitelisted.")
         return
-
     await set_whitelisted(user_id, True)
-    await ctx.send(
-        f"✅ **Whitelisted `{user_id}`.**\n"
-        f"This account will never be flagged by alt detection."
-    )
+    await ctx.send(f"✅ **Whitelisted `{user_id}`.**")
 
 
 @bot.command(name="unwl")
 async def admin_unwhitelist(ctx: commands.Context, user_id: int):
-    """Removes a user from the whitelist."""
     if not is_admin(ctx.author.id):
         return
-
     user = await get_user(user_id)
     if not user:
         await ctx.send(f"❌ `{user_id}` is not registered.")
         return
-
     if not user.get("whitelisted"):
         await ctx.send(f"❌ `{user_id}` is not whitelisted.")
         return
-
     await set_whitelisted(user_id, False)
     await ctx.send(f"✅ Removed `{user_id}` from the whitelist.")
 
 
 @bot.command(name="ip")
 async def admin_ip(ctx: commands.Context):
-    """Shows the most recent IPs and the users tied to them (newest at top)."""
     if not is_admin(ctx.author.id):
         return
 
@@ -1149,7 +1272,6 @@ async def admin_ip(ctx: commands.Context):
 
     header = f"🌐 **Recent IPs** (newest first, {len(rows)} total)\n\n"
     await ctx.send(header + chunks[0])
-
     for chunk in chunks[1:]:
         await ctx.send(chunk)
 
@@ -1210,6 +1332,9 @@ async def admin_check(ctx: commands.Context):
             trusted_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE trusted = TRUE")
             wl_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE whitelisted = TRUE")
             active_orders = await conn.fetchval("SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'")
+            unfilled_orders = await conn.fetchval(
+                "SELECT COUNT(*) FROM joindev.orders WHERE status = 'active' AND members_completed < members_requested"
+            )
             active_joins = await conn.fetchval("SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE")
             total_coins = await conn.fetchval("SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users")
     except Exception as e:
@@ -1223,6 +1348,7 @@ async def admin_check(ctx: commands.Context):
     embed.add_field(name="🚫 Banned", value=f"**{banned_count}**", inline=True)
     embed.add_field(name="🎫 Whitelisted", value=f"**{wl_count}**", inline=True)
     embed.add_field(name="📦 Active Orders", value=f"**{active_orders}**", inline=True)
+    embed.add_field(name="⏳ Unfilled", value=f"**{unfilled_orders}**", inline=True)
     embed.add_field(name="🔗 Pending Joins", value=f"**{active_joins}**", inline=True)
     embed.add_field(name="🪙 Coins", value=f"**{total_coins}**", inline=True)
     await ctx.send(embed=embed)
