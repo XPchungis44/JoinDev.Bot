@@ -88,7 +88,6 @@ MAX_ORDER_SIZE = 50
 NO_ORDER_TIMEOUT = 24 * 60 * 60
 TRUST_PERIOD = 14 * 24 * 60 * 60
 
-# Auto-backfill config
 BACKFILL_INTERVAL_MINUTES = 5
 BACKFILL_MAX_PER_CYCLE = 10
 
@@ -256,9 +255,11 @@ async def auto_backfill_orders():
     Rules:
     - Only active orders with unfilled slots
     - Only farming pool users not already in the guild
-    - Deduct 1 coin per user added (Option A — pay on join)
-    - Skip orders where owner has 0 coins (Option A — skip if low balance)
-    - Max BACKFILL_MAX_PER_CYCLE users added per cycle
+    - Deduct 1 coin per user added
+    - Skip orders where owner has 0 coins
+    - Max BACKFILL_MAX_PER_CYCLE users per cycle
+    - Auto-cancel orders where the bot isn't in the guild (24h+ old)
+    - Support server orders are auto-cancelled with a refund
     """
     log.info("auto_backfill: scanning...")
 
@@ -273,6 +274,7 @@ async def auto_backfill_orders():
         return
 
     total_added = 0
+    now = int(time.time())
 
     for order in orders:
         if total_added >= BACKFILL_MAX_PER_CYCLE:
@@ -286,13 +288,46 @@ async def auto_backfill_orders():
         if remaining <= 0:
             continue
 
-        # Check if bot is still in the guild
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            log.warning(f"auto_backfill: bot not in guild {guild_id}, skipping order #{order_id}")
+        # --- Support server: never backfill, auto-cancel with refund ---
+        if guild_id == SUPPORT_SERVER_ID:
+            if remaining > 0:
+                await add_coins(owner_id, remaining)
+            async with get_pool().acquire() as conn:
+                await conn.execute("""
+                    UPDATE joindev.orders
+                    SET status = 'cancelled', completed_at = $2
+                    WHERE order_id = $1
+                """, order_id, now)
+            log.info(
+                f"auto_backfill: support-server order #{order_id} "
+                f"auto-cancelled, refunded {remaining}"
+            )
             continue
 
-        # Check owner balance
+        # --- Bot not in guild: cancel if 24h+ old ---
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            age = now - order["created_at"]
+            if age > NO_ORDER_TIMEOUT:
+                if remaining > 0:
+                    await add_coins(owner_id, remaining)
+                async with get_pool().acquire() as conn:
+                    await conn.execute("""
+                        UPDATE joindev.orders
+                        SET status = 'cancelled', completed_at = $2
+                        WHERE order_id = $1
+                    """, order_id, now)
+                log.info(
+                    f"auto_backfill: cancelled orphaned order #{order_id} "
+                    f"(bot not in {guild_id}), refunded {remaining}"
+                )
+            else:
+                log.info(
+                    f"auto_backfill: order #{order_id} pending — bot not in guild yet"
+                )
+            continue
+
+        # --- Owner balance check ---
         owner = await get_user(owner_id)
         if not owner:
             continue
@@ -300,7 +335,7 @@ async def auto_backfill_orders():
             log.info(f"auto_backfill: owner {owner_id} has 0 coins, skipping order #{order_id}")
             continue
 
-        # How many can we add this cycle?
+        # --- Determine how many to add ---
         allowance = min(
             remaining,
             owner["joindev_coins"],
@@ -310,14 +345,12 @@ async def auto_backfill_orders():
         if allowance <= 0:
             continue
 
-        # Get users already in this guild via any order
         try:
             already_in_guild = await get_all_users_in_guild_from_orders(guild_id)
         except Exception as e:
             log.error(f"auto_backfill: get users in guild failed: {e}")
             continue
 
-        # Get farming pool candidates, excluding those already in the guild
         try:
             candidates = await get_farming_pool_users(
                 limit=allowance * 3,
@@ -331,12 +364,14 @@ async def auto_backfill_orders():
             log.info(f"auto_backfill: no candidates for order #{order_id}")
             continue
 
-        # Add them via REST (batched)
         to_add = candidates[:allowance]
 
         async with aiohttp.ClientSession() as session:
             tasks = [
-                _add_user_to_guild(session, guild_id, c["user_id"], f"Auto-backfill order #{order_id}")
+                _add_user_to_guild(
+                    session, guild_id, c["user_id"],
+                    f"Auto-backfill order #{order_id}"
+                )
                 for c in to_add
             ]
             results = await asyncio.gather(*tasks)
@@ -344,14 +379,13 @@ async def auto_backfill_orders():
         added_this_order = 0
         for c, ok in zip(to_add, results):
             if ok:
-                # Deduct 1 coin from owner
                 await deduct_coins(owner_id, 1)
-                # Create active join tied to this order
-                await create_active_join(c["user_id"], guild_id, order_id, int(time.time()))
+                await create_active_join(
+                    c["user_id"], guild_id, order_id, int(time.time())
+                )
                 added_this_order += 1
                 total_added += 1
 
-                # Notify the user
                 try:
                     user = await bot.fetch_user(c["user_id"])
                     await user.send(
@@ -1274,6 +1308,82 @@ async def admin_ip(ctx: commands.Context):
     await ctx.send(header + chunks[0])
     for chunk in chunks[1:]:
         await ctx.send(chunk)
+
+
+@bot.command(name="order_info")
+async def admin_order_info(ctx: commands.Context):
+    """Shows all orders and their statuses."""
+    if not is_admin(ctx.author.id):
+        return
+
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT order_id, guild_id, owner_id, status,
+                   members_requested, members_completed
+            FROM joindev.orders
+            ORDER BY order_id
+        """)
+
+    if not rows:
+        await ctx.send("📭 No orders.")
+        return
+
+    lines = []
+    for r in rows:
+        emoji = {"active": "🟢", "completed": "✅", "cancelled": "🚫"}.get(r["status"], "❓")
+        guild = bot.get_guild(r["guild_id"])
+        guild_name = guild.name if guild else f"(not in {r['guild_id']})"
+        lines.append(
+            f"{emoji} **#{r['order_id']}** — {guild_name} — "
+            f"{r['members_completed']}/{r['members_requested']} — `{r['status']}`"
+        )
+
+    msg = "📋 **All Orders**\n\n" + "\n".join(lines)
+    if len(msg) > 1990:
+        chunks = [msg[i:i+1990] for i in range(0, len(msg), 1990)]
+        for c in chunks:
+            await ctx.send(c)
+    else:
+        await ctx.send(msg)
+
+
+@bot.command(name="fix_orders")
+async def admin_fix_orders(ctx: commands.Context):
+    """One-time cleanup: cancels active orders where the bot isn't in the guild."""
+    if not is_admin(ctx.author.id):
+        return
+
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT order_id, guild_id, owner_id, status,
+                   members_requested, members_completed
+            FROM joindev.orders
+            WHERE status = 'active'
+            ORDER BY order_id
+        """)
+
+    if not rows:
+        await ctx.send("✅ No active orders to fix.")
+        return
+
+    fixed = 0
+    for r in rows:
+        oid = r["order_id"]
+        guild = bot.get_guild(r["guild_id"])
+        if not guild:
+            remaining = r["members_requested"] - r["members_completed"]
+            if remaining > 0:
+                await add_coins(r["owner_id"], remaining)
+            async with get_pool().acquire() as conn:
+                await conn.execute("""
+                    UPDATE joindev.orders
+                    SET status = 'cancelled', completed_at = $2
+                    WHERE order_id = $1
+                """, oid, int(time.time()))
+            fixed += 1
+            log.info(f"fix_orders: cancelled order #{oid}, refunded {remaining}")
+
+    await ctx.send(f"✅ Cleaned up **{fixed}** orphaned orders.")
 
 
 @bot.command(name="give")
