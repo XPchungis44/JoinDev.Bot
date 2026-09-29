@@ -106,6 +106,8 @@ def install_alert_handler():
     if not ALERT_WEBHOOK_URL:
         log.warning("install_alert_handler: ALERT_WEBHOOK_URL not set — alerts disabled")
         return
+    # 🧪 TEMPORARY TEST — remove after confirming
+    send_alert("🧪 Test Alert", "If you see this, the webhook works!", 0x5865F2)
 
     handler = WebhookAlertHandler()
     handler.setLevel(logging.ERROR)
