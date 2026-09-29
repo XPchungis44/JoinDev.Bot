@@ -38,16 +38,25 @@ async def init_pool():
                 last_auto_join   BIGINT DEFAULT 0,
                 last_buy_members BIGINT DEFAULT 0,
                 banned           BOOLEAN DEFAULT FALSE,
-                farming_pool     BOOLEAN DEFAULT FALSE
+                farming_pool     BOOLEAN DEFAULT FALSE,
+                ip_address       TEXT,
+                first_seen       BIGINT,
+                trusted          BOOLEAN DEFAULT FALSE,
+                appealed         BOOLEAN DEFAULT FALSE,
+                appeal_note      TEXT
             )
         """)
 
-        # Safe migrations
         for col, definition in [
             ("last_auto_join", "BIGINT DEFAULT 0"),
             ("last_buy_members", "BIGINT DEFAULT 0"),
             ("banned", "BOOLEAN DEFAULT FALSE"),
             ("farming_pool", "BOOLEAN DEFAULT FALSE"),
+            ("ip_address", "TEXT"),
+            ("first_seen", "BIGINT"),
+            ("trusted", "BOOLEAN DEFAULT FALSE"),
+            ("appealed", "BOOLEAN DEFAULT FALSE"),
+            ("appeal_note", "TEXT"),
         ]:
             try:
                 await conn.execute(
@@ -123,19 +132,17 @@ def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-# ---------------------------------------------------------------
-# USERS
-# ---------------------------------------------------------------
-async def upsert_user(user_id, access_token, refresh_token, expires_at):
+async def upsert_user(user_id, access_token, refresh_token, expires_at, ip=None):
     async with _pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at, ip_address, first_seen)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (user_id) DO UPDATE SET
                 access_token = EXCLUDED.access_token,
                 refresh_token = EXCLUDED.refresh_token,
-                token_expires_at = EXCLUDED.token_expires_at
-        """, user_id, access_token, refresh_token, expires_at)
+                token_expires_at = EXCLUDED.token_expires_at,
+                ip_address = COALESCE(EXCLUDED.ip_address, joindev.users.ip_address)
+        """, user_id, access_token, refresh_token, expires_at, ip, int(time.time()))
 
 
 async def get_user(user_id):
@@ -150,6 +157,41 @@ async def get_all_users():
         return [dict(r) for r in rows]
 
 
+async def get_users_by_ip(ip: str):
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM joindev.users WHERE ip_address = $1", ip)
+        return [dict(r) for r in rows]
+
+
+async def get_duplicate_ips():
+    """Returns IPs with 2+ distinct users."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT ip_address, COUNT(*) as count
+            FROM joindev.users
+            WHERE ip_address IS NOT NULL
+              AND banned = FALSE
+              AND trusted = FALSE
+            GROUP BY ip_address
+            HAVING COUNT(*) >= 2
+        """)
+        return [dict(r) for r in rows]
+
+
+async def mark_trusted(user_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET trusted = TRUE WHERE user_id = $1", user_id,
+        )
+
+
+async def strip_coins(user_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET joindev_coins = 0 WHERE user_id = $1", user_id,
+        )
+
+
 async def update_tokens(user_id, access_token, refresh_token, expires_at):
     async with _pool.acquire() as conn:
         await conn.execute("""
@@ -157,14 +199,6 @@ async def update_tokens(user_id, access_token, refresh_token, expires_at):
             SET access_token = $2, refresh_token = $3, token_expires_at = $4
             WHERE user_id = $1
         """, user_id, access_token, refresh_token, expires_at)
-
-
-async def update_coins(user_id, coins):
-    async with _pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE joindev.users SET joindev_coins = $2 WHERE user_id = $1",
-            user_id, coins,
-        )
 
 
 async def add_coins(user_id, amount):
@@ -191,6 +225,14 @@ async def set_banned(user_id, banned: bool):
         await conn.execute(
             "UPDATE joindev.users SET banned = $2 WHERE user_id = $1",
             user_id, banned,
+        )
+
+
+async def set_appealed(user_id: int, note: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET appealed = TRUE, appeal_note = $2 WHERE user_id = $1",
+            user_id, note,
         )
 
 
@@ -258,11 +300,7 @@ async def claim_daily(user_id, now):
             }
 
 
-# ---------------------------------------------------------------
-# FARMING POOL — users willing to be added to servers
-# ---------------------------------------------------------------
 async def get_farming_pool_users(limit: int, exclude_user_ids=None):
-    """Returns users who opted into the farming pool via /auto_join."""
     async with _pool.acquire() as conn:
         if exclude_user_ids:
             rows = await conn.fetch("""
@@ -286,9 +324,6 @@ async def get_farming_pool_users(limit: int, exclude_user_ids=None):
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------
-# SERVER POOL
-# ---------------------------------------------------------------
 async def add_server(guild_id, owner_id, invite_code, now):
     async with _pool.acquire() as conn:
         await conn.execute("""
@@ -320,9 +355,6 @@ async def get_active_servers(exclude_guild_ids=None):
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------
-# ORDERS
-# ---------------------------------------------------------------
 async def create_order(guild_id, owner_id, members, coins, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -360,9 +392,6 @@ async def complete_order(order_id, now):
         """, order_id, now)
 
 
-# ---------------------------------------------------------------
-# ACTIVE JOINS
-# ---------------------------------------------------------------
 async def create_active_join(user_id, guild_id, order_id, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -408,9 +437,6 @@ async def get_user_active_joins(user_id):
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------
-# PENDING WELCOME
-# ---------------------------------------------------------------
 async def queue_welcome_dm(user_id):
     async with _pool.acquire() as conn:
         await conn.execute("""
