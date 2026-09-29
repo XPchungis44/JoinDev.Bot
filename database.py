@@ -1,6 +1,5 @@
 """
 database.py — Async Postgres for JoinDev
-Uses 'joindev' schema to avoid conflicts with other bots.
 """
 
 import os
@@ -16,18 +15,16 @@ if not DATABASE_URL:
 
 _pool: asyncpg.Pool | None = None
 
-THREE_DAYS = 3 * 24 * 60 * 60  # 259200 seconds
+THREE_DAYS = 3 * 24 * 60 * 60
 
 
 async def init_pool():
-    """Creates the connection pool and initializes the schema."""
     global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
 
     async with _pool.acquire() as conn:
         await conn.execute("CREATE SCHEMA IF NOT EXISTS joindev")
 
-        # Users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.users (
                 user_id          BIGINT PRIMARY KEY,
@@ -37,11 +34,26 @@ async def init_pool():
                 joindev_coins    INTEGER DEFAULT 10,
                 daily_streak     INTEGER DEFAULT 0,
                 last_daily       BIGINT DEFAULT 0,
-                do_not_join      INTEGER DEFAULT 0
+                do_not_join      INTEGER DEFAULT 0,
+                last_auto_join   BIGINT DEFAULT 0,
+                last_buy_members BIGINT DEFAULT 0,
+                banned           BOOLEAN DEFAULT FALSE
             )
         """)
 
-        # Server pool
+        # Add missing columns if table already existed
+        for col, definition in [
+            ("last_auto_join", "BIGINT DEFAULT 0"),
+            ("last_buy_members", "BIGINT DEFAULT 0"),
+            ("banned", "BOOLEAN DEFAULT FALSE"),
+        ]:
+            try:
+                await conn.execute(
+                    f"ALTER TABLE joindev.users ADD COLUMN IF NOT EXISTS {col} {definition}"
+                )
+            except Exception:
+                pass
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.server_pool (
                 guild_id     BIGINT PRIMARY KEY,
@@ -52,7 +64,6 @@ async def init_pool():
             )
         """)
 
-        # Orders
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.orders (
                 order_id           SERIAL PRIMARY KEY,
@@ -67,7 +78,6 @@ async def init_pool():
             )
         """)
 
-        # Active joins
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.active_joins (
                 id           SERIAL PRIMARY KEY,
@@ -86,7 +96,6 @@ async def init_pool():
             ON joindev.active_joins (rewarded, left_early, joined_at)
         """)
 
-        # Pending welcome DM queue (replaces /tmp file)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS joindev.pending_welcome (
                 id         SERIAL PRIMARY KEY,
@@ -107,7 +116,6 @@ async def close_pool():
 
 
 def get_pool() -> asyncpg.Pool:
-    """Returns the initialized pool, raising if not ready."""
     if _pool is None:
         raise RuntimeError("Database pool has not been initialized.")
     return _pool
@@ -116,7 +124,7 @@ def get_pool() -> asyncpg.Pool:
 # ---------------------------------------------------------------
 # USERS
 # ---------------------------------------------------------------
-async def upsert_user(user_id: int, access_token: str, refresh_token: str, expires_at: int):
+async def upsert_user(user_id, access_token, refresh_token, expires_at):
     async with _pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at)
@@ -128,19 +136,19 @@ async def upsert_user(user_id: int, access_token: str, refresh_token: str, expir
         """, user_id, access_token, refresh_token, expires_at)
 
 
-async def get_user(user_id: int) -> dict | None:
+async def get_user(user_id):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM joindev.users WHERE user_id = $1", user_id)
         return dict(row) if row else None
 
 
-async def get_all_users() -> list[dict]:
+async def get_all_users():
     async with _pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM joindev.users")
         return [dict(r) for r in rows]
 
 
-async def update_tokens(user_id: int, access_token: str, refresh_token: str, expires_at: int):
+async def update_tokens(user_id, access_token, refresh_token, expires_at):
     async with _pool.acquire() as conn:
         await conn.execute("""
             UPDATE joindev.users
@@ -149,7 +157,7 @@ async def update_tokens(user_id: int, access_token: str, refresh_token: str, exp
         """, user_id, access_token, refresh_token, expires_at)
 
 
-async def update_coins(user_id: int, coins: int):
+async def update_coins(user_id, coins):
     async with _pool.acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET joindev_coins = $2 WHERE user_id = $1",
@@ -157,8 +165,7 @@ async def update_coins(user_id: int, coins: int):
         )
 
 
-async def add_coins(user_id: int, amount: int) -> int:
-    """Atomically adds coins. Returns new balance."""
+async def add_coins(user_id, amount):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE joindev.users
@@ -169,7 +176,7 @@ async def add_coins(user_id: int, amount: int) -> int:
         return row["joindev_coins"] if row else 0
 
 
-async def set_do_not_join(user_id: int, flag: bool):
+async def set_do_not_join(user_id, flag):
     async with _pool.acquire() as conn:
         await conn.execute(
             "UPDATE joindev.users SET do_not_join = $2 WHERE user_id = $1",
@@ -177,9 +184,34 @@ async def set_do_not_join(user_id: int, flag: bool):
         )
 
 
-async def claim_daily(user_id: int, now: int) -> dict:
+async def set_banned(user_id, banned: bool):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET banned = $2 WHERE user_id = $1",
+            user_id, banned,
+        )
+
+
+async def touch_auto_join(user_id, now):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET last_auto_join = $2 WHERE user_id = $1",
+            user_id, now,
+        )
+
+
+async def touch_buy_members(user_id, now):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE joindev.users SET last_buy_members = $2 WHERE user_id = $1",
+            user_id, now,
+        )
+
+
+async def claim_daily(user_id, now):
     COOLDOWN = 24 * 60 * 60
     BASE_REWARD = 3
+    MAX_COINS = 10000
 
     async with _pool.acquire() as conn:
         async with conn.transaction():
@@ -200,7 +232,7 @@ async def claim_daily(user_id: int, now: int) -> dict:
 
             new_streak = streak + 1 if elapsed < COOLDOWN * 2 else 1
             coins_awarded = BASE_REWARD + (new_streak - 1)
-            new_balance = balance + coins_awarded
+            new_balance = min(balance + coins_awarded, MAX_COINS)
 
             await conn.execute("""
                 UPDATE joindev.users
@@ -210,7 +242,7 @@ async def claim_daily(user_id: int, now: int) -> dict:
 
             return {
                 "success": True,
-                "coins_awarded": coins_awarded,
+                "coins_awarded": new_balance - balance,
                 "new_streak": new_streak,
                 "new_balance": new_balance,
             }
@@ -219,7 +251,7 @@ async def claim_daily(user_id: int, now: int) -> dict:
 # ---------------------------------------------------------------
 # SERVER POOL
 # ---------------------------------------------------------------
-async def add_server(guild_id: int, owner_id: int, invite_code: str, now: int):
+async def add_server(guild_id, owner_id, invite_code, now):
     async with _pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO joindev.server_pool (guild_id, owner_id, invite_code, added_at)
@@ -231,15 +263,14 @@ async def add_server(guild_id: int, owner_id: int, invite_code: str, now: int):
         """, guild_id, owner_id, invite_code, now)
 
 
-async def remove_server(guild_id: int):
+async def remove_server(guild_id):
     async with _pool.acquire() as conn:
         await conn.execute(
-            "UPDATE joindev.server_pool SET active = FALSE WHERE guild_id = $1",
-            guild_id,
+            "UPDATE joindev.server_pool SET active = FALSE WHERE guild_id = $1", guild_id,
         )
 
 
-async def get_active_servers(exclude_guild_ids: list[int] = None) -> list[dict]:
+async def get_active_servers(exclude_guild_ids=None):
     async with _pool.acquire() as conn:
         if exclude_guild_ids:
             rows = await conn.fetch("""
@@ -254,7 +285,7 @@ async def get_active_servers(exclude_guild_ids: list[int] = None) -> list[dict]:
 # ---------------------------------------------------------------
 # ORDERS
 # ---------------------------------------------------------------
-async def create_order(guild_id: int, owner_id: int, members: int, coins: int, now: int) -> int:
+async def create_order(guild_id, owner_id, members, coins, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO joindev.orders
@@ -265,13 +296,13 @@ async def create_order(guild_id: int, owner_id: int, members: int, coins: int, n
         return row["order_id"]
 
 
-async def get_order(order_id: int) -> dict | None:
+async def get_order(order_id):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM joindev.orders WHERE order_id = $1", order_id)
         return dict(row) if row else None
 
 
-async def increment_order_completed(order_id: int) -> dict:
+async def increment_order_completed(order_id):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE joindev.orders
@@ -282,7 +313,7 @@ async def increment_order_completed(order_id: int) -> dict:
         return dict(row) if row else {}
 
 
-async def complete_order(order_id: int, now: int):
+async def complete_order(order_id, now):
     async with _pool.acquire() as conn:
         await conn.execute("""
             UPDATE joindev.orders
@@ -294,7 +325,7 @@ async def complete_order(order_id: int, now: int):
 # ---------------------------------------------------------------
 # ACTIVE JOINS
 # ---------------------------------------------------------------
-async def create_active_join(user_id: int, guild_id: int, order_id: int | None, now: int) -> int:
+async def create_active_join(user_id, guild_id, order_id, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO joindev.active_joins (user_id, guild_id, order_id, joined_at)
@@ -304,19 +335,17 @@ async def create_active_join(user_id: int, guild_id: int, order_id: int | None, 
         return row["id"]
 
 
-async def get_pending_joins() -> list[dict]:
+async def get_pending_joins():
     cutoff = int(time.time()) - THREE_DAYS
     async with _pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT * FROM joindev.active_joins
-            WHERE rewarded = FALSE
-              AND left_early = FALSE
-              AND joined_at <= $1
+            WHERE rewarded = FALSE AND left_early = FALSE AND joined_at <= $1
         """, cutoff)
         return [dict(r) for r in rows]
 
 
-async def mark_join_rewarded(join_id: int):
+async def mark_join_rewarded(join_id):
     async with _pool.acquire() as conn:
         await conn.execute(
             "UPDATE joindev.active_joins SET rewarded = TRUE, checked_at = $2 WHERE id = $1",
@@ -324,7 +353,7 @@ async def mark_join_rewarded(join_id: int):
         )
 
 
-async def mark_join_left_early(join_id: int):
+async def mark_join_left_early(join_id):
     async with _pool.acquire() as conn:
         await conn.execute(
             "UPDATE joindev.active_joins SET left_early = TRUE, checked_at = $2 WHERE id = $1",
@@ -332,7 +361,7 @@ async def mark_join_left_early(join_id: int):
         )
 
 
-async def get_user_active_joins(user_id: int) -> list[dict]:
+async def get_user_active_joins(user_id):
     async with _pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT * FROM joindev.active_joins
@@ -342,10 +371,9 @@ async def get_user_active_joins(user_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------
-# PENDING WELCOME DM QUEUE
+# PENDING WELCOME
 # ---------------------------------------------------------------
-async def queue_welcome_dm(user_id: int):
-    """Inserts a pending welcome DM row for the bot to process."""
+async def queue_welcome_dm(user_id):
     async with _pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO joindev.pending_welcome (user_id, created_at)
@@ -353,8 +381,7 @@ async def queue_welcome_dm(user_id: int):
         """, user_id, int(time.time()))
 
 
-async def get_pending_welcome_dms() -> list[dict]:
-    """Returns all unsent pending welcome DMs, oldest first."""
+async def get_pending_welcome_dms():
     async with _pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT * FROM joindev.pending_welcome
@@ -365,9 +392,8 @@ async def get_pending_welcome_dms() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def mark_welcome_sent(pending_id: int):
+async def mark_welcome_sent(pending_id):
     async with _pool.acquire() as conn:
         await conn.execute(
-            "UPDATE joindev.pending_welcome SET sent = TRUE WHERE id = $1",
-            pending_id,
+            "UPDATE joindev.pending_welcome SET sent = TRUE WHERE id = $1", pending_id,
         )
