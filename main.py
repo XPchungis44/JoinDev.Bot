@@ -11,6 +11,8 @@ import threading
 from flask import Flask, jsonify
 
 from oauth_callback import oauth_bp
+from database import init_pool
+from alerts import install_alert_handler
 
 log = logging.getLogger("joindev")
 
@@ -54,7 +56,15 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Start the bot — it will init the DB pool on its own loop
+    # Install webhook alerts BEFORE anything else
+    install_alert_handler()
+
+    # Init DB pool once on the bot's eventual loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_pool())
+
+    # Start the bot in a background thread
     threading.Thread(target=start_bot, daemon=True).start()
 
     # Run Flask on Render's port (blocking)
