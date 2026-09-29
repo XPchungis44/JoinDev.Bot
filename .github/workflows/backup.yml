@@ -10,9 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Install PostgreSQL 18 Client
         run: |
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
@@ -20,17 +17,44 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-18
 
-      - name: Dump and Compress Database
+      - name: Dump database to .sql.gz
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          FILENAME="joindev_$(date +'%Y-%m-%d_%H%M%S').sql.gz"
-          /usr/lib/postgresql/18/bin/pg_dump "$DATABASE_URL" | gzip > "$FILENAME"
+          FILENAME="joindev_$(date -u +'%Y-%m-%d_%H%M%S').sql.gz"
+          /usr/lib/postgresql/18/bin/pg_dump "$DATABASE_URL" | gzip > "/tmp/$FILENAME"
           echo "BACKUP_FILENAME=$FILENAME" >> $GITHUB_ENV
 
-      - name: Upload Backup to GitHub Repo
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BACKUP_FILENAME }}
-          path: ${{ env.BACKUP_FILENAME }}
-          retention-days: 14
+      - name: Clone backup repo
+        env:
+          BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          git clone https://x-access-token:${BACKUP_TOKEN}@github.com/XPchungis44/JoinDev.backup.git /tmp/backup-repo
+
+      - name: Add new backup to repo
+        run: |
+          cd /tmp/backup-repo
+          mkdir -p backups
+          cp "/tmp/${{ env.BACKUP_FILENAME }}" backups/
+          ls -la backups/
+
+      - name: Prune old backups (keep 14 most recent)
+        run: |
+          cd /tmp/backup-repo
+          # Keep only the 14 newest .sql.gz files
+          ls -t backups/*.sql.gz | tail -n +15 | xargs -r rm -f
+
+      - name: Commit and push
+        env:
+          BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          cd /tmp/backup-repo
+          git config user.name "JoinDev Backup Bot"
+          git config user.email "backup@joindev.local"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Backup ${{ env.BACKUP_FILENAME }}"
+            git push
+          fi
