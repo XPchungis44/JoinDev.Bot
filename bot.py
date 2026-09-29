@@ -1,9 +1,10 @@
 """
-bot.py — JoinDev Discord bot (commands + background tasks)
+bot.py — JoinDev Discord bot
 """
 
 import os
 import time
+import asyncio
 import logging
 
 import aiohttp
@@ -16,10 +17,10 @@ from welcome import build_welcome_embed
 from database import (
     init_pool,
     get_pool,
-    upsert_user,
     get_user,
     claim_daily,
     set_do_not_join,
+    set_banned,
     add_server,
     get_active_servers,
     create_order,
@@ -34,6 +35,8 @@ from database import (
     update_tokens,
     get_pending_welcome_dms,
     mark_welcome_sent,
+    touch_auto_join,
+    touch_buy_members,
     THREE_DAYS,
 )
 
@@ -56,18 +59,20 @@ INSTALL_URL = (
 SUPPORT_SERVER_ID = 1512995317430096063
 ADMIN_USER_ID = 1459373221756538923
 
+# Anti-abuse constants
+COOLDOWN_AUTO_JOIN = 10       # seconds
+COOLDOWN_BUY_MEMBERS = 30     # seconds
+MAX_COINS = 10000
+MAX_ORDER_SIZE = 50
+
 
 # ---------------------------------------------------------------
-# SHARED HELPER — ADD A USER TO A GUILD VIA REST API
+# SHARED HELPER — ADD USER TO GUILD VIA REST
 # ---------------------------------------------------------------
-async def _add_user_to_guild(guild_id: int, user_id: int, reason: str = "JoinDev") -> bool:
-    """
-    Adds a user to a guild using their stored OAuth token.
-    Returns True on success (or already-a-member), False otherwise.
-    """
+async def _add_user_to_guild(session: aiohttp.ClientSession, guild_id: int, user_id: int, reason: str = "JoinDev") -> bool:
     user_data = await get_user(user_id)
     if not user_data or not user_data.get("access_token"):
-        log.error(f"add_user: no OAuth token for user {user_id}")
+        log.error(f"add_user: no token for {user_id}")
         return False
 
     url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}"
@@ -79,14 +84,13 @@ async def _add_user_to_guild(guild_id: int, user_id: int, reason: str = "JoinDev
     payload = {"access_token": user_data["access_token"]}
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.put(url, headers=headers, json=payload) as resp:
-                if resp.status in (201, 204):
-                    log.info(f"add_user: ✅ {user_id} → {guild_id}")
-                    return True
-                body = await resp.text()
-                log.error(f"add_user: ❌ {resp.status} for {user_id} → {guild_id}: {body}")
-                return False
+        async with session.put(url, headers=headers, json=payload) as resp:
+            if resp.status in (201, 204):
+                log.info(f"add_user: ✅ {user_id} → {guild_id}")
+                return True
+            body = await resp.text()
+            log.error(f"add_user: ❌ {resp.status} for {user_id} → {guild_id}: {body}")
+            return False
     except Exception as e:
         log.error(f"add_user: ❌ request failed for {user_id} → {guild_id}: {e}")
         return False
@@ -103,65 +107,45 @@ async def setup_hook():
 
 
 # ---------------------------------------------------------------
-# WELCOME DM QUEUE WATCHER
+# WELCOME QUEUE WATCHER (every 3s for speed)
 # ---------------------------------------------------------------
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=3)
 async def watch_welcome_queue():
-    log.info("watch_welcome_queue: tick")
     try:
         pending = await get_pending_welcome_dms()
     except Exception as e:
-        log.error(f"watch_welcome_queue: fetch failed — {type(e).__name__}: {e}")
+        log.error(f"watch_welcome_queue: fetch failed — {e}")
         return
-
-    log.info(f"watch_welcome_queue: {len(pending)} pending")
 
     if not pending:
         return
 
+    log.info(f"watch_welcome_queue: {len(pending)} pending")
+
     for row in pending:
         user_id = row["user_id"]
-        log.info(f"watch_welcome_queue: processing user {user_id} (row id {row['id']})")
 
-        # 1. Add to support server FIRST
-        await _add_to_support_server(user_id)
+        # Add to support server
+        async with aiohttp.ClientSession() as session:
+            ok = await _add_user_to_guild(session, SUPPORT_SERVER_ID, user_id, "JoinDev authorization")
+            if not ok:
+                log.error(f"support_server: failed to add {user_id}")
 
-        # 2. Then send the DM
+        # Send DM
         try:
             user = await bot.fetch_user(user_id)
             await user.send(embed=build_welcome_embed())
             log.info(f"watch_welcome_queue: ✅ DM sent to {user_id}")
         except discord.Forbidden:
-            log.warning(f"watch_welcome_queue: ❌ Cannot DM {user_id} — DMs closed.")
+            log.warning(f"watch_welcome_queue: ❌ Cannot DM {user_id}")
         except discord.HTTPException as e:
-            log.error(f"watch_welcome_queue: ❌ DM failed for {user_id}: {e}")
+            log.error(f"watch_welcome_queue: ❌ DM failed: {e}")
 
-        # 3. Mark as done
-        try:
-            await mark_welcome_sent(row["id"])
-            log.info(f"watch_welcome_queue: marked row {row['id']} as sent")
-        except Exception as e:
-            log.error(f"watch_welcome_queue: failed to mark row {row['id']}: {e}")
-
-
-async def _add_to_support_server(user_id: int):
-    """Adds a user to the support server using their OAuth2 token via REST."""
-    guild = bot.get_guild(SUPPORT_SERVER_ID)
-    if not guild:
-        log.warning(f"support_server: bot NOT in guild {SUPPORT_SERVER_ID}")
-        return
-
-    if guild.get_member(user_id) is not None:
-        log.info(f"support_server: user {user_id} already in guild")
-        return
-
-    ok = await _add_user_to_guild(SUPPORT_SERVER_ID, user_id, reason="JoinDev authorization")
-    if not ok:
-        log.error(f"support_server: failed to add {user_id}")
+        await mark_welcome_sent(row["id"])
 
 
 # ---------------------------------------------------------------
-# 3-DAY JOIN REWARD CHECKER
+# 3-DAY REWARD CHECKER
 # ---------------------------------------------------------------
 @tasks.loop(hours=1)
 async def check_join_rewards():
@@ -169,7 +153,7 @@ async def check_join_rewards():
     if not pending:
         return
 
-    log.info(f"check_join_rewards: {len(pending)} pending joins")
+    log.info(f"check_join_rewards: {len(pending)} pending")
 
     for join in pending:
         user_id = join["user_id"]
@@ -208,8 +192,7 @@ async def check_join_rewards():
                         owner = await bot.fetch_user(updated["owner_id"])
                         await owner.send(
                             f"✅ **Your order is complete!**\n"
-                            f"All **{updated['members_requested']}** members completed their stay.\n"
-                            f"The bot will now leave your server."
+                            f"All **{updated['members_requested']}** members completed their stay."
                         )
                     except (discord.Forbidden, discord.HTTPException):
                         pass
@@ -217,12 +200,11 @@ async def check_join_rewards():
                     await _leave_guild(guild_id)
 
         except Exception as e:
-            log.error(f"check_join_rewards: error on join {join['id']}: {e}")
+            log.error(f"check_join_rewards: error on {join['id']}: {e}")
 
 
-async def _leave_guild(guild_id: int):
+async def _leave_guild(guild_id):
     if guild_id == SUPPORT_SERVER_ID:
-        log.warning(f"leave_guild: refusing to leave support server")
         return
     guild = bot.get_guild(guild_id)
     if guild:
@@ -230,7 +212,7 @@ async def _leave_guild(guild_id: int):
             await guild.leave()
             log.info(f"leave_guild: left {guild_id}")
         except discord.HTTPException as e:
-            log.error(f"leave_guild: failed — {e}")
+            log.error(f"leave_guild: failed: {e}")
 
 
 # ---------------------------------------------------------------
@@ -243,9 +225,7 @@ async def refresh_tokens():
     now = int(time.time())
 
     for u in await get_all_users():
-        if not u["token_expires_at"]:
-            continue
-        if u["token_expires_at"] - now > 86400:
+        if not u["token_expires_at"] or u["token_expires_at"] - now > 86400:
             continue
         data = {
             "client_id": client_id,
@@ -268,7 +248,7 @@ async def refresh_tokens():
             )
             log.info(f"refresh_tokens: refreshed {u['user_id']}")
         except Exception as e:
-            log.error(f"refresh_tokens: failed for {u['user_id']}: {e}")
+            log.error(f"refresh_tokens: failed {u['user_id']}: {e}")
 
 
 # ---------------------------------------------------------------
@@ -276,30 +256,23 @@ async def refresh_tokens():
 # ---------------------------------------------------------------
 @bot.event
 async def on_ready():
-    log.info(f"on_ready: logged in as {bot.user} (ID: {bot.user.id})")
-    log.info(f"on_ready: in {len(bot.guilds)} guild(s)")
+    log.info(f"on_ready: {bot.user} (ID: {bot.user.id})")
+    log.info(f"on_ready: {len(bot.guilds)} guild(s)")
     for g in bot.guilds:
-        log.info(f"on_ready: guild → {g.name} ({g.id})")
+        log.info(f"on_ready: → {g.name} ({g.id})")
 
     try:
         synced = await bot.tree.sync()
-        log.info(f"on_ready: synced {len(synced)} slash commands")
+        log.info(f"on_ready: synced {len(synced)} commands")
     except Exception as e:
-        log.error(f"on_ready: slash sync failed: {e}")
+        log.error(f"on_ready: sync failed: {e}")
 
     if not watch_welcome_queue.is_running():
         watch_welcome_queue.start()
-        log.info("on_ready: started watch_welcome_queue")
-    else:
-        log.info("on_ready: watch_welcome_queue already running")
-
     if not check_join_rewards.is_running():
         check_join_rewards.start()
-        log.info("on_ready: started check_join_rewards")
-
     if not refresh_tokens.is_running():
         refresh_tokens.start()
-        log.info("on_ready: started refresh_tokens")
 
 
 # ---------------------------------------------------------------
@@ -314,7 +287,7 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🪙 Earn JoinCoins",
-        value="`/daily` — Claim 3+ JoinCoins every 24 hours\n`/balance` — Check your balance",
+        value="`/daily` — Claim 3+ JoinCoins every 24 hours\n`/balance` — Check your balance\n`/status` — See your active joins",
         inline=False,
     )
     embed.add_field(
@@ -337,7 +310,7 @@ async def help_cmd(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------
-# USER SLASH COMMANDS
+# USER COMMANDS
 # ---------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check if JoinDev is online.")
 async def ping(interaction: discord.Interaction):
@@ -361,15 +334,47 @@ async def balance(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="status", description="See your active joins.")
+async def status_cmd(interaction: discord.Interaction):
+    from database import get_user_active_joins
+
+    user = await get_user(interaction.user.id)
+    if not user:
+        await interaction.response.send_message(
+            "Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True,
+        )
+        return
+
+    joins = await get_user_active_joins(interaction.user.id)
+
+    embed = discord.Embed(title="📊 Your JoinDev Status", color=0x5865F2)
+    embed.add_field(name="🪙 Coins", value=f"**{user['joindev_coins']}**", inline=True)
+    embed.add_field(name="🔥 Streak", value=f"**{user['daily_streak']}**", inline=True)
+    embed.add_field(name="🔗 Active Joins", value=f"**{len(joins)}**", inline=True)
+
+    if joins:
+        lines = []
+        for j in joins[:10]:
+            g = bot.get_guild(j["guild_id"])
+            name = g.name if g else f"Guild {j['guild_id']}"
+            days_left = max(0, (j["joined_at"] + THREE_DAYS - int(time.time())) // 86400)
+            lines.append(f"• **{name}** — {days_left}d left")
+        embed.add_field(name="Pending Rewards", value="\n".join(lines), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="daily", description="Claim your daily JoinCoins reward.")
 async def daily(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     user = await get_user(interaction.user.id)
     if not user:
-        await interaction.followup.send(
-            "Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True,
-        )
+        await interaction.followup.send("Authorize first.", ephemeral=True)
         return
+    if user["banned"]:
+        await interaction.followup.send("🚫 You are banned from JoinDev.", ephemeral=True)
+        return
+
     result = await claim_daily(interaction.user.id, int(time.time()))
     if not result["success"]:
         if result.get("reason") == "cooldown":
@@ -381,6 +386,7 @@ async def daily(interaction: discord.Interaction):
         else:
             await interaction.followup.send("Something went wrong.", ephemeral=True)
         return
+
     embed = discord.Embed(title="🪙 Daily Reward Claimed!", color=0x5865F2)
     embed.add_field(name="Coins", value=f"**+{result['coins_awarded']}**", inline=True)
     embed.add_field(name="Streak", value=f"🔥 **{result['new_streak']}**", inline=True)
@@ -454,8 +460,19 @@ async def auto_join(interaction: discord.Interaction, amount: str):
     if not user:
         await interaction.followup.send("Authorize first.", ephemeral=True)
         return
+    if user["banned"]:
+        await interaction.followup.send("🚫 You are banned.", ephemeral=True)
+        return
     if user["do_not_join"]:
         await interaction.followup.send("🚫 Auto-joins disabled.", ephemeral=True)
+        return
+
+    # Anti-abuse cooldown
+    now = int(time.time())
+    last = user.get("last_auto_join") or 0
+    if now - last < COOLDOWN_AUTO_JOIN:
+        wait = COOLDOWN_AUTO_JOIN - (now - last)
+        await interaction.followup.send(f"⏳ Wait **{wait}s** before using this again.", ephemeral=True)
         return
 
     balance = user["joindev_coins"]
@@ -488,25 +505,23 @@ async def auto_join(interaction: discord.Interaction, amount: str):
             "UPDATE joindev.users SET joindev_coins = joindev_coins - $2 WHERE user_id = $1",
             interaction.user.id, to_join,
         )
+    await touch_auto_join(interaction.user.id, now)
 
-    joined = 0
-    failed = 0
-    for srv in servers:
-        guild = bot.get_guild(srv["guild_id"])
-        if not guild:
-            failed += 1
-            continue
+    # Concurrent adds for speed
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _add_user_to_guild(session, srv["guild_id"], interaction.user.id, "JoinDev auto-join")
+            for srv in servers
+        ]
+        results = await asyncio.gather(*tasks)
 
-        ok = await _add_user_to_guild(
-            srv["guild_id"], interaction.user.id, reason="JoinDev auto-join"
-        )
+    joined = sum(1 for r in results if r)
+    failed = len(results) - joined
+
+    # Create active joins for successful adds
+    for srv, ok in zip(servers, results):
         if ok:
-            await create_active_join(
-                interaction.user.id, srv["guild_id"], None, int(time.time())
-            )
-            joined += 1
-        else:
-            failed += 1
+            await create_active_join(interaction.user.id, srv["guild_id"], None, now)
 
     if failed:
         await add_coins(interaction.user.id, failed)
@@ -540,6 +555,19 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             content="Authorize first: https://xpchungis44.github.io/JoinDev/"
         )
         return
+    if user["banned"]:
+        await interaction.edit_original_response(content="🚫 You are banned.")
+        return
+
+    # Anti-abuse cooldown
+    now = int(time.time())
+    last = user.get("last_buy_members") or 0
+    if now - last < COOLDOWN_BUY_MEMBERS:
+        wait = COOLDOWN_BUY_MEMBERS - (now - last)
+        await interaction.edit_original_response(
+            content=f"⏳ Wait **{wait}s** before ordering again."
+        )
+        return
 
     balance = user["joindev_coins"]
     if balance <= 0:
@@ -558,9 +586,12 @@ async def buy_members(interaction: discord.Interaction, amount: str):
             await interaction.edit_original_response(content=f"Invalid. You have {balance}.")
             return
 
+    to_order = min(to_order, MAX_ORDER_SIZE)
+
     order_id = await create_order(
-        interaction.guild.id, interaction.user.id, to_order, to_order, int(time.time()),
+        interaction.guild.id, interaction.user.id, to_order, to_order, now,
     )
+    await touch_buy_members(interaction.user.id, now)
 
     async with get_pool().acquire() as conn:
         await conn.execute(
@@ -569,36 +600,51 @@ async def buy_members(interaction: discord.Interaction, amount: str):
         )
         candidates = await conn.fetch("""
             SELECT user_id FROM joindev.users
-            WHERE do_not_join = FALSE AND user_id != $1
+            WHERE do_not_join = FALSE AND banned = FALSE AND user_id != $1
+            ORDER BY RANDOM()
             LIMIT $2
         """, interaction.user.id, to_order)
 
-    added = 0
-    for c in candidates:
-        if interaction.guild.get_member(c["user_id"]):
-            continue
+    log.info(f"buy_members: order #{order_id}, {len(candidates)} candidates found")
 
-        ok = await _add_user_to_guild(
-            interaction.guild.id, c["user_id"], reason=f"JoinDev order #{order_id}"
+    if not candidates:
+        await interaction.edit_original_response(
+            content="❌ No eligible users in the pool yet. Try again later."
         )
+        return
+
+    # Concurrent adds for speed
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _add_user_to_guild(session, interaction.guild.id, c["user_id"], f"JoinDev order #{order_id}")
+            for c in candidates
+            if not interaction.guild.get_member(c["user_id"])
+        ]
+        results = await asyncio.gather(*tasks)
+
+    added = 0
+    for c, ok in zip([c for c in candidates if not interaction.guild.get_member(c["user_id"])], results):
         if ok:
-            await create_active_join(
-                c["user_id"], interaction.guild.id, order_id, int(time.time())
-            )
+            await create_active_join(c["user_id"], interaction.guild.id, order_id, now)
             added += 1
+
+    # Refund coins for members we couldn't add
+    refund = to_order - added
+    if refund > 0:
+        await add_coins(interaction.user.id, refund)
 
     await interaction.edit_original_response(
         content=(
             f"✅ **Order #{order_id} placed!**\n"
             f"Requested: **{to_order}** • Added: **{added}**\n"
-            f"Coins spent: **{to_order}**\n\n"
+            f"Coins spent: **{added}** • Refunded: **{refund}**\n\n"
             f"Members stay 3 days. Then I leave your server."
         )
     )
 
 
 # ---------------------------------------------------------------
-# ADMIN PREFIX COMMANDS
+# ADMIN COMMANDS
 # ---------------------------------------------------------------
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
@@ -610,36 +656,41 @@ async def admin_join(ctx: commands.Context, guild_id: int, amount: str):
         return
     guild = bot.get_guild(guild_id)
     if not guild:
-        await ctx.send(f"❌ Bot is not in server `{guild_id}`.")
+        await ctx.send(f"❌ Not in `{guild_id}`.")
         return
 
     async with get_pool().acquire() as conn:
         if amount.lower() == "max":
-            rows = await conn.fetch("SELECT user_id FROM joindev.users WHERE do_not_join = FALSE")
+            rows = await conn.fetch(
+                "SELECT user_id FROM joindev.users WHERE do_not_join = FALSE AND banned = FALSE"
+            )
         else:
             try:
                 n = int(amount)
             except ValueError:
-                await ctx.send("❌ Amount must be a number or 'max'.")
+                await ctx.send("❌ Number or 'max'.")
                 return
             rows = await conn.fetch(
-                "SELECT user_id FROM joindev.users WHERE do_not_join = FALSE LIMIT $1", n,
+                "SELECT user_id FROM joindev.users WHERE do_not_join = FALSE AND banned = FALSE LIMIT $1",
+                n,
             )
 
-    added = 0
-    skipped = 0
-    for r in rows:
-        uid = r["user_id"]
-        if guild.get_member(uid):
-            skipped += 1
-            continue
+    targets = [r["user_id"] for r in rows if not guild.get_member(r["user_id"])]
+    if not targets:
+        await ctx.send("No eligible users.")
+        return
 
-        ok = await _add_user_to_guild(guild_id, uid, reason="Admin .join")
+    async with aiohttp.ClientSession() as session:
+        tasks = [_add_user_to_guild(session, guild_id, uid, "Admin .join") for uid in targets]
+        results = await asyncio.gather(*tasks)
+
+    added = 0
+    for uid, ok in zip(targets, results):
         if ok:
-            await create_active_join(uid, guild.id, None, int(time.time()))
+            await create_active_join(uid, guild_id, None, int(time.time()))
             added += 1
 
-    await ctx.send(f"✅ Added **{added}** to **{guild.name}**. Skipped: **{skipped}**")
+    await ctx.send(f"✅ Added **{added}** to **{guild.name}**.")
 
 
 @bot.command(name="give")
@@ -648,10 +699,26 @@ async def admin_give(ctx: commands.Context, user_id: int, amount: int):
         return
     user = await get_user(user_id)
     if not user:
-        await ctx.send(f"❌ User `{user_id}` not authorized.")
+        await ctx.send(f"❌ `{user_id}` not authorized.")
         return
     new_balance = await add_coins(user_id, amount)
-    await ctx.send(f"✅ Gave **{amount}** to <@{user_id}>. New balance: **{new_balance}**")
+    await ctx.send(f"✅ Gave **{amount}** to <@{user_id}>. Balance: **{new_balance}**")
+
+
+@bot.command(name="ban")
+async def admin_ban(ctx: commands.Context, user_id: int):
+    if not is_admin(ctx.author.id):
+        return
+    await set_banned(user_id, True)
+    await ctx.send(f"✅ Banned `{user_id}`.")
+
+
+@bot.command(name="unban")
+async def admin_unban(ctx: commands.Context, user_id: int):
+    if not is_admin(ctx.author.id):
+        return
+    await set_banned(user_id, False)
+    await ctx.send(f"✅ Unbanned `{user_id}`.")
 
 
 @bot.command(name="check")
@@ -662,37 +729,28 @@ async def admin_check(ctx: commands.Context):
     try:
         async with get_pool().acquire() as conn:
             auth_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users")
-            active_orders = await conn.fetchval(
-                "SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'"
-            )
+            active_orders = await conn.fetchval("SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'")
             active_joins = await conn.fetchval(
                 "SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE"
             )
-            total_coins = await conn.fetchval(
-                "SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users"
-            )
-            total_servers = await conn.fetchval(
-                "SELECT COUNT(*) FROM joindev.server_pool WHERE active = TRUE"
-            )
-            completed_orders = await conn.fetchval(
-                "SELECT COUNT(*) FROM joindev.orders WHERE status = 'completed'"
-            )
-            pending_welcome = await conn.fetchval(
-                "SELECT COUNT(*) FROM joindev.pending_welcome WHERE sent = FALSE"
-            )
+            total_coins = await conn.fetchval("SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users")
+            total_servers = await conn.fetchval("SELECT COUNT(*) FROM joindev.server_pool WHERE active = TRUE")
+            completed_orders = await conn.fetchval("SELECT COUNT(*) FROM joindev.orders WHERE status = 'completed'")
+            pending_welcome = await conn.fetchval("SELECT COUNT(*) FROM joindev.pending_welcome WHERE sent = FALSE")
+            banned = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE banned = TRUE")
     except Exception as e:
-        await ctx.send(f"❌ **DB error:** `{type(e).__name__}: {e}`")
-        log.error(f"admin_check: {e}")
+        await ctx.send(f"❌ DB error: `{e}`")
         return
 
     embed = discord.Embed(title="📊 JoinDev Stats", color=0x5865F2)
-    embed.add_field(name="👥 Authorized Users", value=f"**{auth_count}**", inline=True)
+    embed.add_field(name="👥 Users", value=f"**{auth_count}**", inline=True)
+    embed.add_field(name="🚫 Banned", value=f"**{banned}**", inline=True)
     embed.add_field(name="📦 Active Orders", value=f"**{active_orders}**", inline=True)
-    embed.add_field(name="✅ Completed Orders", value=f"**{completed_orders}**", inline=True)
+    embed.add_field(name="✅ Completed", value=f"**{completed_orders}**", inline=True)
     embed.add_field(name="🔗 Pending Joins", value=f"**{active_joins}**", inline=True)
-    embed.add_field(name="🌐 Active Servers", value=f"**{total_servers}**", inline=True)
-    embed.add_field(name="🪙 Total JoinCoins Held", value=f"**{total_coins}**", inline=True)
-    embed.add_field(name="📨 Pending Welcome DMs", value=f"**{pending_welcome}**", inline=True)
+    embed.add_field(name="🌐 Servers", value=f"**{total_servers}**", inline=True)
+    embed.add_field(name="🪙 Coins Held", value=f"**{total_coins}**", inline=True)
+    embed.add_field(name="📨 Pending DMs", value=f"**{pending_welcome}**", inline=True)
     await ctx.send(embed=embed)
 
 
@@ -701,11 +759,11 @@ async def admin_leave(ctx: commands.Context, guild_id: int):
     if not is_admin(ctx.author.id):
         return
     if guild_id == SUPPORT_SERVER_ID:
-        await ctx.send("❌ Refusing to leave the support server.")
+        await ctx.send("❌ Refusing to leave support server.")
         return
     guild = bot.get_guild(guild_id)
     if not guild:
-        await ctx.send(f"❌ Not in server `{guild_id}`.")
+        await ctx.send(f"❌ Not in `{guild_id}`.")
         return
     await guild.leave()
     await ctx.send(f"✅ Left **{guild.name}**.")
