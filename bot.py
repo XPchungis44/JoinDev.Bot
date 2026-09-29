@@ -91,6 +91,10 @@ TRUST_PERIOD = 14 * 24 * 60 * 60
 BACKFILL_INTERVAL_MINUTES = 5
 BACKFILL_MAX_PER_CYCLE = 10
 
+WEBSITE_URL = "https://xpchungis44.github.io/JoinDev/"
+TOS_URL = "https://xpchungis44.github.io/JoinDev/tos"
+PRIVACY_URL = "https://xpchungis44.github.io/JoinDev/privacy"
+
 
 # ---------------------------------------------------------------
 # BLACKLIST EMBED
@@ -249,18 +253,6 @@ async def detect_alts():
 # ---------------------------------------------------------------
 @tasks.loop(minutes=BACKFILL_INTERVAL_MINUTES)
 async def auto_backfill_orders():
-    """
-    Fills unfilled order slots with farming pool users.
-
-    Rules:
-    - Only active orders with unfilled slots
-    - Only farming pool users not already in the guild
-    - Deduct 1 coin per user added
-    - Skip orders where owner has 0 coins
-    - Max BACKFILL_MAX_PER_CYCLE users per cycle
-    - Auto-cancel orders where the bot isn't in the guild (24h+ old)
-    - Support server orders are auto-cancelled with a refund
-    """
     log.info("auto_backfill: scanning...")
 
     try:
@@ -288,7 +280,6 @@ async def auto_backfill_orders():
         if remaining <= 0:
             continue
 
-        # --- Support server: never backfill, auto-cancel with refund ---
         if guild_id == SUPPORT_SERVER_ID:
             if remaining > 0:
                 await add_coins(owner_id, remaining)
@@ -298,13 +289,9 @@ async def auto_backfill_orders():
                     SET status = 'cancelled', completed_at = $2
                     WHERE order_id = $1
                 """, order_id, now)
-            log.info(
-                f"auto_backfill: support-server order #{order_id} "
-                f"auto-cancelled, refunded {remaining}"
-            )
+            log.info(f"auto_backfill: support-server order #{order_id} auto-cancelled, refunded {remaining}")
             continue
 
-        # --- Bot not in guild: cancel if 24h+ old ---
         guild = bot.get_guild(guild_id)
         if not guild:
             age = now - order["created_at"]
@@ -317,17 +304,11 @@ async def auto_backfill_orders():
                         SET status = 'cancelled', completed_at = $2
                         WHERE order_id = $1
                     """, order_id, now)
-                log.info(
-                    f"auto_backfill: cancelled orphaned order #{order_id} "
-                    f"(bot not in {guild_id}), refunded {remaining}"
-                )
+                log.info(f"auto_backfill: cancelled orphaned order #{order_id} (bot not in {guild_id}), refunded {remaining}")
             else:
-                log.info(
-                    f"auto_backfill: order #{order_id} pending — bot not in guild yet"
-                )
+                log.info(f"auto_backfill: order #{order_id} pending — bot not in guild yet")
             continue
 
-        # --- Owner balance check ---
         owner = await get_user(owner_id)
         if not owner:
             continue
@@ -335,7 +316,6 @@ async def auto_backfill_orders():
             log.info(f"auto_backfill: owner {owner_id} has 0 coins, skipping order #{order_id}")
             continue
 
-        # --- Determine how many to add ---
         allowance = min(
             remaining,
             owner["joindev_coins"],
@@ -368,10 +348,7 @@ async def auto_backfill_orders():
 
         async with aiohttp.ClientSession() as session:
             tasks = [
-                _add_user_to_guild(
-                    session, guild_id, c["user_id"],
-                    f"Auto-backfill order #{order_id}"
-                )
+                _add_user_to_guild(session, guild_id, c["user_id"], f"Auto-backfill order #{order_id}")
                 for c in to_add
             ]
             results = await asyncio.gather(*tasks)
@@ -380,9 +357,7 @@ async def auto_backfill_orders():
         for c, ok in zip(to_add, results):
             if ok:
                 await deduct_coins(owner_id, 1)
-                await create_active_join(
-                    c["user_id"], guild_id, order_id, int(time.time())
-                )
+                await create_active_join(c["user_id"], guild_id, order_id, int(time.time()))
                 added_this_order += 1
                 total_added += 1
 
@@ -685,6 +660,127 @@ async def check_banned(interaction: discord.Interaction) -> bool:
 
 
 # ---------------------------------------------------------------
+# START (onboarding)
+# ---------------------------------------------------------------
+@bot.tree.command(name="start", description="New here? Start with this — full walkthrough.")
+async def start_cmd(interaction: discord.Interaction):
+    if await check_banned(interaction):
+        return
+
+    user = await get_user(interaction.user.id)
+    if not user:
+        await interaction.response.send_message(
+            f"**You need to authorize JoinDev first.**\nVisit the website to get started:\n{WEBSITE_URL}",
+            ephemeral=True,
+        )
+        return
+
+    embed1 = discord.Embed(
+        title="👋 Welcome to JoinDev!",
+        description=(
+            "*Server growth made easy!*\n\n"
+            "JoinDev is a **free Discord bot** that helps you grow your server by "
+            "trading members with other servers — no paywalls, no fake accounts."
+        ),
+        color=0x5865F2,
+    )
+    embed1.add_field(
+        name="📚 The System (in one sentence)",
+        value="You join other servers to earn **JoinCoins** → you spend those coins to bring **real members** to your own server.",
+        inline=False,
+    )
+    embed1.add_field(
+        name="🪙 What's a JoinCoin?",
+        value="**1 JoinCoin = 1 member.**\nYou start with **10 free coins** just for authorizing.",
+        inline=False,
+    )
+    embed1.add_field(
+        name="📖 Read more",
+        value=f"Run `/help` for the full command list.\nRead our **[TOS]({TOS_URL})** and **[Privacy Policy]({PRIVACY_URL})**.",
+        inline=False,
+    )
+    embed1.set_footer(text="Page 1 of 4 • Scroll for more")
+
+    embed2 = discord.Embed(
+        title="💰 How to Earn JoinCoins",
+        description="Two ways to build up your balance:",
+        color=0x5865F2,
+    )
+    embed2.add_field(
+        name="📅 `/daily` — Free daily coins",
+        value="Claim **3 JoinCoins every 24 hours**.\nKeep your streak going for **+1 extra per consecutive day**.\n*Day 1 = 3 • Day 2 = 4 • Day 3 = 5 • ...*",
+        inline=False,
+    )
+    embed2.add_field(
+        name="🚀 `/auto_join` — Get paid to join servers",
+        value="Enter the **farming pool**. You'll be added to servers in the network.\nEach server you stay in for **3 full days** = **1 JoinCoin back**.",
+        inline=False,
+    )
+    embed2.add_field(
+        name="💼 Check your balance anytime",
+        value="`/balance` — see your JoinCoins and streak\n`/status` — see where you're farming",
+        inline=False,
+    )
+    embed2.set_footer(text="Page 2 of 4 • Scroll for more")
+
+    embed3 = discord.Embed(
+        title="📈 How to Grow Your Server",
+        description="Spend your JoinCoins to bring real members to your server.",
+        color=0x5865F2,
+    )
+    embed3.add_field(
+        name="Step 1 — Submit your server",
+        value="Run `/submit_server <invite>` **inside your server**.\nThen add the bot to that server if it isn't already there.",
+        inline=False,
+    )
+    embed3.add_field(
+        name="Step 2 — Place your order",
+        value="Run `/buy_members <amount>` or `/buy_members max`.\nExample: `/buy_members 20` = 20 members for 20 JoinCoins.",
+        inline=False,
+    )
+    embed3.add_field(
+        name="Step 3 — Members start joining",
+        value="Members are added **instantly** if the pool is ready.\nThey must stay **3 full days** for the order to count.",
+        inline=False,
+    )
+    embed3.set_footer(text="Page 3 of 4 • Scroll for more")
+
+    embed4 = discord.Embed(
+        title="⚠️ What Happens If the Pool Is Small",
+        description="**Your order is never cancelled just because members aren't ready.**",
+        color=0xF0B232,
+    )
+    embed4.add_field(
+        name="🧠 Here's how it actually works",
+        value=(
+            "Say you order **100 members** but only **20 farming users** are available.\n\n"
+            "• **20 members get added** right away\n"
+            "• **You get refunded 80 JoinCoins** (for the unfilled slots)\n"
+            "• **Your order stays ACTIVE**, waiting for more users\n"
+            "• As new users enter the farming pool → **they get auto-added**\n"
+            "• **1 JoinCoin is deducted** for each slot that fills"
+        ),
+        inline=False,
+    )
+    embed4.add_field(
+        name="💡 Why this is fair",
+        value="You only pay for what actually happens. Coins return to you if the slot never fills. If it does fill later, you pay then.",
+        inline=False,
+    )
+    embed4.add_field(
+        name="🛠 Want to stop waiting?",
+        value="`/cancel_order` — refunds unfilled slots, keeps existing members\n`/full_cancel_order` — undoes everything, kicks members, rewards them anyway",
+        inline=False,
+    )
+    embed4.set_footer(text="Page 4 of 4 • You're ready!")
+
+    await interaction.response.send_message(embed=embed1)
+    await interaction.followup.send(embed=embed2)
+    await interaction.followup.send(embed=embed3)
+    await interaction.followup.send(embed=embed4)
+
+
+# ---------------------------------------------------------------
 # HELP
 # ---------------------------------------------------------------
 @bot.tree.command(name="help", description="Show all JoinDev commands.")
@@ -693,6 +789,11 @@ async def help_cmd(interaction: discord.Interaction):
         return
 
     embed = discord.Embed(title="📖 JoinDev Commands", color=0x5865F2)
+    embed.add_field(
+        name="🚀 New Here?",
+        value="`/start` — Full walkthrough of how JoinDev works",
+        inline=False,
+    )
     embed.add_field(
         name="🪙 Earn JoinCoins",
         value="`/daily` — Claim coins\n`/balance` — Check balance\n`/status` — Your status",
@@ -728,7 +829,7 @@ async def balance(interaction: discord.Interaction):
         return
     user = await get_user(interaction.user.id)
     if not user:
-        await interaction.response.send_message("Authorize first: https://xpchungis44.github.io/JoinDev/", ephemeral=True)
+        await interaction.response.send_message(f"Authorize first: {WEBSITE_URL}", ephemeral=True)
         return
     await interaction.response.send_message(
         f"🪙 **{user['joindev_coins']} JoinCoins**\n🔥 Streak: **{user['daily_streak']}**",
@@ -1165,11 +1266,7 @@ async def appeal(ctx: commands.Context, note: str, user_id: int):
             color=0xF0B232,
         )
         embed.add_field(name="Appeal Note", value=note[:1024], inline=False)
-        embed.add_field(
-            name="Actions",
-            value=f"`.unban {user_id}` — Accept\n`.check` — View stats",
-            inline=False,
-        )
+        embed.add_field(name="Actions", value=f"`.unban {user_id}` — Accept\n`.check` — View stats", inline=False)
         await admin.send(embed=embed)
     except Exception as e:
         log.error(f"appeal: notify admin failed: {e}")
@@ -1192,14 +1289,11 @@ def is_admin(user_id: int) -> bool:
 async def admin_unban(ctx: commands.Context, user_id: int):
     if not is_admin(ctx.author.id):
         return
-
     user = await get_user(user_id)
     if not user:
         await ctx.send(f"❌ `{user_id}` not registered.")
         return
-
     await set_banned(user_id, False)
-
     try:
         target = await bot.fetch_user(user_id)
         await target.send(
@@ -1209,7 +1303,6 @@ async def admin_unban(ctx: commands.Context, user_id: int):
         )
     except (discord.Forbidden, discord.HTTPException):
         pass
-
     await ctx.send(f"✅ Unbanned `{user_id}` and sent notification.")
 
 
@@ -1312,7 +1405,6 @@ async def admin_ip(ctx: commands.Context):
 
 @bot.command(name="order_info")
 async def admin_order_info(ctx: commands.Context):
-    """Shows all orders and their statuses."""
     if not is_admin(ctx.author.id):
         return
 
@@ -1349,7 +1441,6 @@ async def admin_order_info(ctx: commands.Context):
 
 @bot.command(name="fix_orders")
 async def admin_fix_orders(ctx: commands.Context):
-    """One-time cleanup: cancels active orders where the bot isn't in the guild."""
     if not is_admin(ctx.author.id):
         return
 
