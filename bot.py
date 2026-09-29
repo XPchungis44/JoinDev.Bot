@@ -22,12 +22,14 @@ from database import (
     set_do_not_join,
     set_banned,
     set_appealed,
+    set_whitelisted,
     set_farming_pool,
     add_server,
     get_active_servers,
     get_farming_pool_users,
     get_duplicate_ips,
     get_users_by_ip,
+    get_recent_ips,
     mark_trusted,
     strip_coins,
     create_order,
@@ -70,7 +72,6 @@ TICKET_CHANNEL_URL = (
     "1512995317430096063/1521312991507775599/1536401203997442140"
 )
 
-# Users who never get flagged as alts (your test accounts)
 WHITELISTED_IDS = {
     1459373221756538923,  # your main
     # Add your test alt IDs here
@@ -81,7 +82,7 @@ COOLDOWN_BUY_MEMBERS = 30
 MAX_COINS = 10000
 MAX_ORDER_SIZE = 50
 NO_ORDER_TIMEOUT = 24 * 60 * 60
-TRUST_PERIOD = 14 * 24 * 60 * 60  # 14 days
+TRUST_PERIOD = 14 * 24 * 60 * 60
 
 
 # ---------------------------------------------------------------
@@ -122,7 +123,6 @@ async def _dm_blacklist(user_id: int):
 
 
 async def _notify_blacklist(user_id: int, interaction: discord.Interaction = None):
-    """Sends the blacklist embed via interaction or DM."""
     if interaction:
         try:
             if interaction.response.is_done():
@@ -180,7 +180,6 @@ async def setup_hook():
 # ---------------------------------------------------------------
 @tasks.loop(hours=1)
 async def detect_alts():
-    """Finds shared IPs across accounts. Bans + strips coins."""
     log.info("detect_alts: scanning...")
 
     try:
@@ -201,15 +200,14 @@ async def detect_alts():
             log.error(f"detect_alts: fetch users for {ip} failed: {e}")
             continue
 
-        # Filter out whitelisted + trusted + already banned
         flagged = [
             u for u in users
             if u["user_id"] not in WHITELISTED_IDS
             and not u.get("trusted")
+            and not u.get("whitelisted")
             and not u.get("banned")
         ]
 
-        # Need at least 2 non-whitelisted accounts sharing the IP
         if len(flagged) < 2:
             continue
 
@@ -226,7 +224,6 @@ async def detect_alts():
             except Exception as e:
                 log.error(f"detect_alts: ban failed for {uid}: {e}")
 
-    # Mark trusted users (2+ weeks, never flagged)
     now = int(time.time())
     try:
         async with get_pool().acquire() as conn:
@@ -508,10 +505,9 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------
-# BANNED CHECK DECORATOR
+# BANNED CHECK
 # ---------------------------------------------------------------
 async def check_banned(interaction: discord.Interaction) -> bool:
-    """Returns True if the user is banned. Sends the blacklist embed."""
     user = await get_user(interaction.user.id)
     if user and user.get("banned"):
         await _notify_blacklist(interaction.user.id, interaction)
@@ -970,10 +966,9 @@ async def full_cancel_order(interaction: discord.Interaction):
 @bot.command(name="appeal")
 async def appeal(ctx: commands.Context, note: str, user_id: int):
     """Available even to banned users. Usage: .appeal <note> <your_user_id>"""
-    # Must match author's ID exactly (proof they know it)
     if ctx.author.id != user_id:
         try:
-            await ctx.send("❌ The user ID must match your own. Enable Developer Mode and copy your ID.", delete_after=10)
+            await ctx.send("❌ The user ID must match your own.", delete_after=10)
         except Exception:
             pass
         return
@@ -993,7 +988,6 @@ async def appeal(ctx: commands.Context, note: str, user_id: int):
 
     await set_appealed(user_id, note)
 
-    # Notify admin
     try:
         admin = await bot.fetch_user(ADMIN_USER_ID)
         embed = discord.Embed(
@@ -1061,6 +1055,105 @@ async def admin_ban(ctx: commands.Context, user_id: int):
     await ctx.send(f"✅ Banned + stripped `{user_id}`.")
 
 
+@bot.command(name="wl")
+async def admin_whitelist(ctx: commands.Context, user_id: int):
+    """Whitelists a user — they will never be flagged as an alt."""
+    if not is_admin(ctx.author.id):
+        return
+
+    user = await get_user(user_id)
+    if not user:
+        await ctx.send(f"❌ `{user_id}` is not registered with JoinDev.")
+        return
+
+    if user.get("whitelisted"):
+        await ctx.send(f"✅ `{user_id}` is already whitelisted.")
+        return
+
+    await set_whitelisted(user_id, True)
+    await ctx.send(
+        f"✅ **Whitelisted `{user_id}`.**\n"
+        f"This account will never be flagged by alt detection."
+    )
+
+
+@bot.command(name="unwl")
+async def admin_unwhitelist(ctx: commands.Context, user_id: int):
+    """Removes a user from the whitelist."""
+    if not is_admin(ctx.author.id):
+        return
+
+    user = await get_user(user_id)
+    if not user:
+        await ctx.send(f"❌ `{user_id}` is not registered.")
+        return
+
+    if not user.get("whitelisted"):
+        await ctx.send(f"❌ `{user_id}` is not whitelisted.")
+        return
+
+    await set_whitelisted(user_id, False)
+    await ctx.send(f"✅ Removed `{user_id}` from the whitelist.")
+
+
+@bot.command(name="ip")
+async def admin_ip(ctx: commands.Context):
+    """Shows the most recent IPs and the users tied to them (newest at top)."""
+    if not is_admin(ctx.author.id):
+        return
+
+    try:
+        rows = await get_recent_ips(limit=25)
+    except Exception as e:
+        await ctx.send(f"❌ DB error: `{e}`")
+        return
+
+    if not rows:
+        await ctx.send("📭 No IPs recorded yet.")
+        return
+
+    lines = []
+    for r in rows:
+        uid = r["user_id"]
+        ip = r["ip_address"]
+        first_seen = r["first_seen"] or 0
+        ts = time.strftime("%m/%d %H:%M", time.localtime(first_seen))
+
+        flags = []
+        if r.get("banned"):
+            flags.append("🚫")
+        if r.get("trusted"):
+            flags.append("✅")
+        if r.get("whitelisted"):
+            flags.append("🎫")
+        flag_str = " ".join(flags) if flags else ""
+
+        try:
+            user = await bot.fetch_user(uid)
+            name = f"{user.name}"
+        except Exception:
+            name = "unknown"
+
+        lines.append(f"`{ip:<15}` — **{name}** (`{uid}`) {flag_str} {ts}")
+
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 2 > 1900:
+            chunks.append(current)
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        chunks.append(current)
+
+    header = f"🌐 **Recent IPs** (newest first, {len(rows)} total)\n\n"
+    await ctx.send(header + chunks[0])
+
+    for chunk in chunks[1:]:
+        await ctx.send(chunk)
+
+
 @bot.command(name="give")
 async def admin_give(ctx: commands.Context, user_id: int, amount: int):
     if not is_admin(ctx.author.id):
@@ -1115,6 +1208,7 @@ async def admin_check(ctx: commands.Context):
             pool_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE farming_pool = TRUE")
             banned_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE banned = TRUE")
             trusted_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE trusted = TRUE")
+            wl_count = await conn.fetchval("SELECT COUNT(*) FROM joindev.users WHERE whitelisted = TRUE")
             active_orders = await conn.fetchval("SELECT COUNT(*) FROM joindev.orders WHERE status = 'active'")
             active_joins = await conn.fetchval("SELECT COUNT(*) FROM joindev.active_joins WHERE rewarded = FALSE AND left_early = FALSE")
             total_coins = await conn.fetchval("SELECT COALESCE(SUM(joindev_coins), 0) FROM joindev.users")
@@ -1127,6 +1221,7 @@ async def admin_check(ctx: commands.Context):
     embed.add_field(name="🎯 In Pool", value=f"**{pool_count}**", inline=True)
     embed.add_field(name="✅ Trusted", value=f"**{trusted_count}**", inline=True)
     embed.add_field(name="🚫 Banned", value=f"**{banned_count}**", inline=True)
+    embed.add_field(name="🎫 Whitelisted", value=f"**{wl_count}**", inline=True)
     embed.add_field(name="📦 Active Orders", value=f"**{active_orders}**", inline=True)
     embed.add_field(name="🔗 Pending Joins", value=f"**{active_joins}**", inline=True)
     embed.add_field(name="🪙 Coins", value=f"**{total_coins}**", inline=True)
