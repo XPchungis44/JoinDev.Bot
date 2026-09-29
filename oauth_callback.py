@@ -1,7 +1,5 @@
 """
 oauth_callback.py — Discord OAuth2 callback
-Exchanges code for tokens, stores user, queues welcome DM.
-Uses a one-off asyncpg connection (not the shared pool) to avoid loop conflicts.
 """
 
 import os
@@ -54,28 +52,36 @@ def fetch_user_id(access_token: str) -> int | None:
         return None
 
 
-async def _store_user(user_id, access_token, refresh_token, expires_at):
-    """Writes to Postgres using a one-off connection, not the shared pool."""
-    log.info(f"_store_user: connecting to DB for user {user_id}")
+async def _store_user(user_id, access_token, refresh_token, expires_at, ip):
+    log.info(f"_store_user: user {user_id} from IP {ip}")
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("""
-            INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO joindev.users (user_id, access_token, refresh_token, token_expires_at, ip_address, first_seen)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (user_id) DO UPDATE SET
                 access_token = EXCLUDED.access_token,
                 refresh_token = EXCLUDED.refresh_token,
-                token_expires_at = EXCLUDED.token_expires_at
-        """, user_id, access_token, refresh_token, expires_at)
-        log.info(f"_store_user: upserted user {user_id}")
+                token_expires_at = EXCLUDED.token_expires_at,
+                ip_address = COALESCE(EXCLUDED.ip_address, joindev.users.ip_address)
+        """, user_id, access_token, refresh_token, expires_at, ip, int(time.time()))
 
         await conn.execute("""
             INSERT INTO joindev.pending_welcome (user_id, created_at)
             VALUES ($1, $2)
         """, user_id, int(time.time()))
-        log.info(f"_store_user: queued welcome DM for {user_id}")
+
+        log.info(f"_store_user: stored {user_id}")
     finally:
         await conn.close()
+
+
+def get_client_ip() -> str:
+    """Gets the real client IP behind Render's proxy."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
 
 
 @oauth_bp.route("/callback")
@@ -83,7 +89,6 @@ def callback():
     log.info("callback: hit")
     code = request.args.get("code")
     if not code:
-        log.warning("callback: missing code")
         return jsonify({"error": "missing_code"}), 400
 
     token_data = exchange_code(code)
@@ -99,13 +104,14 @@ def callback():
     if not user_id:
         return jsonify({"error": "failed_to_fetch_user"}), 500
 
-    log.info(f"callback: got user_id {user_id}")
+    ip = get_client_ip()
+    log.info(f"callback: user_id {user_id} from {ip}")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
-            _store_user(user_id, access_token, refresh_token, expires_at)
+            _store_user(user_id, access_token, refresh_token, expires_at, ip)
         )
     except Exception as e:
         log.error(f"callback: DB write failed for {user_id} — {type(e).__name__}: {e}")
