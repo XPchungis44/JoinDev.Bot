@@ -203,7 +203,6 @@ async def set_whitelisted(user_id: int, whitelisted: bool):
 
 
 async def get_recent_ips(limit: int = 20):
-    """Returns the most recently seen IPs with their user info."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT user_id, ip_address, first_seen, banned, trusted, whitelisted
@@ -347,6 +346,56 @@ async def get_farming_pool_users(limit: int, exclude_user_ids=None):
         return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------
+# AUTO-BACKFILL HELPERS
+# ---------------------------------------------------------------
+async def get_active_orders_with_remaining():
+    """Returns active orders that haven't been fully filled yet."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM joindev.orders
+            WHERE status = 'active'
+              AND members_completed < members_requested
+            ORDER BY created_at ASC
+        """)
+        return [dict(r) for r in rows]
+
+
+async def get_users_in_order(order_id: int):
+    """Returns all user_ids who have an active join tied to this order."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id FROM joindev.active_joins
+            WHERE order_id = $1 AND left_early = FALSE
+        """, order_id)
+        return [r["user_id"] for r in rows]
+
+
+async def get_all_users_in_guild_from_orders(guild_id: int):
+    """Returns all user_ids ever added to this guild via any order."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT user_id FROM joindev.active_joins
+            WHERE guild_id = $1
+        """, guild_id)
+        return [r["user_id"] for r in rows]
+
+
+async def deduct_coins(user_id: int, amount: int) -> int:
+    """Atomically deducts coins, floor at 0. Returns new balance."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE joindev.users
+            SET joindev_coins = GREATEST(joindev_coins - $2, 0)
+            WHERE user_id = $1
+            RETURNING joindev_coins
+        """, user_id, amount)
+        return row["joindev_coins"] if row else 0
+
+
+# ---------------------------------------------------------------
+# SERVER POOL
+# ---------------------------------------------------------------
 async def add_server(guild_id, owner_id, invite_code, now):
     async with _pool.acquire() as conn:
         await conn.execute("""
@@ -378,6 +427,9 @@ async def get_active_servers(exclude_guild_ids=None):
         return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------
+# ORDERS
+# ---------------------------------------------------------------
 async def create_order(guild_id, owner_id, members, coins, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -415,6 +467,9 @@ async def complete_order(order_id, now):
         """, order_id, now)
 
 
+# ---------------------------------------------------------------
+# ACTIVE JOINS
+# ---------------------------------------------------------------
 async def create_active_join(user_id, guild_id, order_id, now):
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -460,6 +515,9 @@ async def get_user_active_joins(user_id):
         return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------
+# PENDING WELCOME
+# ---------------------------------------------------------------
 async def queue_welcome_dm(user_id):
     async with _pool.acquire() as conn:
         await conn.execute("""
